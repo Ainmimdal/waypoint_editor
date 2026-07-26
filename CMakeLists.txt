@@ -21,6 +21,7 @@ find_package(std_msgs REQUIRED)
 find_package(nav2_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(pcl_conversions REQUIRED)
+find_package(sahabat_interfaces REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
 if(TARGET Qt6::Core)
@@ -88,6 +89,7 @@ ament_target_dependencies(${PROJECT_NAME}
   nav2_msgs
   sensor_msgs
   pcl_conversions
+  sahabat_interfaces
 )
 
 pluginlib_export_plugin_description_file(rviz_common plugin_description.xml)
@@ -132,6 +134,7 @@ ament_export_dependencies(
   std_srvs
   std_msgs
   nav2_msgs
+  sahabat_interfaces
   yaml-cpp
 )
 

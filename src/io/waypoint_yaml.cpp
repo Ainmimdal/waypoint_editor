@@ -1,6 +1,7 @@
 #include "waypoint_editor/io/waypoint_yaml.hpp"
 
 #include <fstream>
+#include <cmath>
 #include <ostream>
 #include <sstream>
 #include <string>
@@ -28,17 +29,20 @@ std::string EscapeYamlString(const std::string &input)
     return oss.str();
 }
 
-void WritePose(std::ostream &os, const geometry_msgs::msg::Pose &pose, const std::string &indent)
+double YawFromPose(const geometry_msgs::msg::Pose &pose)
 {
-    os << indent << "position:\n";
-    os << indent << "  x: " << pose.position.x << "\n";
-    os << indent << "  y: " << pose.position.y << "\n";
-    os << indent << "  z: " << pose.position.z << "\n";
-    os << indent << "orientation:\n";
-    os << indent << "  x: " << pose.orientation.x << "\n";
-    os << indent << "  y: " << pose.orientation.y << "\n";
-    os << indent << "  z: " << pose.orientation.z << "\n";
-    os << indent << "  w: " << pose.orientation.w << "\n";
+    const auto &q = pose.orientation;
+    return std::atan2(
+        2.0 * (q.w * q.z + q.x * q.y),
+        1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+}
+
+geometry_msgs::msg::Quaternion QuaternionFromYaw(double yaw)
+{
+    geometry_msgs::msg::Quaternion q;
+    q.z = std::sin(yaw / 2.0);
+    q.w = std::cos(yaw / 2.0);
+    return q;
 }
 
 }  // namespace
@@ -51,16 +55,20 @@ bool WaypointYaml::Save(const std::vector<Waypoint> &waypoints, const std::strin
         return false;
     }
 
+    ofs << "revision: 0\n";
     ofs << "waypoints:\n";
     for (std::size_t i = 0; i < waypoints.size(); ++i) {
         const auto &wp = waypoints[i];
-        ofs << "  - id: " << i << "\n";
-        ofs << "    frame_id: " << wp.pose.header.frame_id << "\n";
-        ofs << "    pose:\n";
-        WritePose(ofs, wp.pose.pose, "      ");
-        if (!wp.function_command.empty()) {
-            ofs << "    command: \"" << EscapeYamlString(wp.function_command) << "\"\n";
-        }
+        const auto name = wp.function_command.empty()
+            ? "waypoint_" + std::to_string(i + 1)
+            : wp.function_command;
+        ofs << "- id: " << i << "\n";
+        ofs << "  name: \"" << EscapeYamlString(name) << "\"\n";
+        ofs << "  x: " << wp.pose.pose.position.x << "\n";
+        ofs << "  y: " << wp.pose.pose.position.y << "\n";
+        ofs << "  yaw: " << YawFromPose(wp.pose.pose) << "\n";
+        ofs << "  dwell_seconds: 0.0\n";
+        ofs << "  enabled: true\n";
     }
 
     error.clear();
@@ -101,6 +109,34 @@ bool PopulatePose(const YAML::Node &pose_node, geometry_msgs::msg::Pose &pose)
            ReadPoseComponent(orientation, "w", pose.orientation.w);
 }
 
+bool PopulateSahabatPose(const YAML::Node &entry, Waypoint &waypoint)
+{
+    double x = 0.0;
+    double y = 0.0;
+    double yaw = 0.0;
+    if (!ReadPoseComponent(entry, "x", x) || !ReadPoseComponent(entry, "y", y)) {
+        return false;
+    }
+    if (auto yaw_node = entry["yaw"]; yaw_node) {
+        try {
+            yaw = yaw_node.as<double>();
+        } catch (const YAML::Exception &) {
+            yaw = 0.0;
+        }
+    }
+    waypoint.pose.header.frame_id = "map";
+    waypoint.pose.pose.position.x = x;
+    waypoint.pose.pose.position.y = y;
+    waypoint.pose.pose.position.z = 0.0;
+    waypoint.pose.pose.orientation = QuaternionFromYaw(yaw);
+    if (auto name_node = entry["name"]; name_node && name_node.IsScalar()) {
+        waypoint.function_command = name_node.as<std::string>();
+    } else {
+        waypoint.function_command.clear();
+    }
+    return true;
+}
+
 }  // namespace
 
 bool WaypointYaml::Load(const std::string &path, std::vector<Waypoint> &waypoints, std::string &error)
@@ -125,26 +161,28 @@ bool WaypointYaml::Load(const std::string &path, std::vector<Waypoint> &waypoint
             continue;
         }
 
-        const auto pose_node = entry["pose"];
-        if (!pose_node || !pose_node.IsMap()) {
-            continue;
-        }
-
         Waypoint waypoint;
-        if (!PopulatePose(pose_node, waypoint.pose.pose)) {
-            continue;
-        }
-
-        if (auto frame_node = entry["frame_id"]; frame_node && frame_node.IsScalar()) {
-            waypoint.pose.header.frame_id = frame_node.as<std::string>();
+        const auto pose_node = entry["pose"];
+        if (pose_node && pose_node.IsMap()) {
+            if (!PopulatePose(pose_node, waypoint.pose.pose)) {
+                continue;
+            }
+            if (auto frame_node = entry["frame_id"]; frame_node && frame_node.IsScalar()) {
+                waypoint.pose.header.frame_id = frame_node.as<std::string>();
+            } else {
+                waypoint.pose.header.frame_id = "map";
+            }
+            if (auto command_node = entry["command"]; command_node && command_node.IsScalar()) {
+                waypoint.function_command = command_node.as<std::string>();
+            } else if (auto name_node = entry["name"]; name_node && name_node.IsScalar()) {
+                waypoint.function_command = name_node.as<std::string>();
+            } else {
+                waypoint.function_command.clear();
+            }
         } else {
-            waypoint.pose.header.frame_id = "map";
-        }
-
-        if (auto command_node = entry["command"]; command_node && command_node.IsScalar()) {
-            waypoint.function_command = command_node.as<std::string>();
-        } else {
-            waypoint.function_command.clear();
+            if (!PopulateSahabatPose(entry, waypoint)) {
+                continue;
+            }
         }
 
         parsed.emplace_back(std::move(waypoint));

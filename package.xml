@@ -24,6 +24,7 @@
   <build_depend>nav2_msgs</build_depend>   
   <build_depend>sensor_msgs</build_depend>
   <build_depend>pcl_conversions</build_depend>
+  <build_depend>sahabat_interfaces</build_depend>
   <build_depend>yaml-cpp</build_depend>
   <build_depend condition="$ROS_DISTRO == jazzy or $ROS_DISTRO == rolling">qt6-base-dev</build_depend>
   <build_depend condition="$ROS_DISTRO != jazzy and $ROS_DISTRO != rolling">qtbase5-dev</build_depend>
@@ -43,6 +44,7 @@
   <exec_depend>nav2_msgs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>pcl_conversions</exec_depend>
+  <exec_depend>sahabat_interfaces</exec_depend>
   <exec_depend>yaml-cpp</exec_depend>
   <exec_depend condition="$ROS_DISTRO == jazzy or $ROS_DISTRO == rolling">qt6-base-dev</exec_depend>
   <exec_depend condition="$ROS_DISTRO != jazzy and $ROS_DISTRO != rolling">qtbase5-dev</exec_depend>
@@ -55,5 +57,6 @@
 
   <export>
     <build_type>ament_cmake</build_type>
+    <rviz_common plugin="${prefix}/plugin_description.xml"/>
   </export>
 </package>

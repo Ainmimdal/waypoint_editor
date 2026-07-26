@@ -17,9 +17,19 @@
 #include <QFileDialog>
 #include <QString>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cctype>
+#include <cstdlib>
+#include <fstream>
+#include <filesystem>
+#include <future>
+#include <regex>
+#include <sstream>
 #include <string>
 #include <vector>
+
+#include <yaml-cpp/yaml.h>
 
 #include <tf2/exceptions.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
@@ -34,8 +44,63 @@ using namespace std::placeholders;
 namespace waypoint_editor
 {
 
+namespace
+{
+
+std::string ExpandUserPath(std::string path)
+{
+    if (!path.empty() && path[0] == '~') {
+        const char *home = std::getenv("HOME");
+        if (home != nullptr) {
+            path.replace(0, 1, home);
+        }
+    }
+    return path;
+}
+
+double YawFromPose(const geometry_msgs::msg::Pose &pose)
+{
+    const auto &q = pose.orientation;
+    return std::atan2(
+        2.0 * (q.w * q.z + q.x * q.y),
+        1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+}
+
+std::string EscapeYamlString(const std::string &input)
+{
+    std::ostringstream oss;
+    for (const auto ch : input) {
+        if (ch == '"') {
+            oss << "\\\"";
+        } else {
+            oss << ch;
+        }
+    }
+    return oss.str();
+}
+
+std::string Trim(const std::string &input)
+{
+    const auto first = std::find_if_not(input.begin(), input.end(), [](unsigned char ch) { return std::isspace(ch); });
+    const auto last = std::find_if_not(input.rbegin(), input.rend(), [](unsigned char ch) { return std::isspace(ch); }).base();
+    if (first >= last) {
+        return "";
+    }
+    return std::string(first, last);
+}
+
+}  // namespace
+
 WaypointEditorTool::WaypointEditorTool() : rviz_default_plugins::tools::PoseTool() {}
-WaypointEditorTool::~WaypointEditorTool() {}
+WaypointEditorTool::~WaypointEditorTool()
+{
+    if (backend_executor_) {
+        backend_executor_->cancel();
+    }
+    if (backend_thread_.joinable()) {
+        backend_thread_.join();
+    }
+}
 
 void WaypointEditorTool::onInitialize()
 {
@@ -47,9 +112,24 @@ void WaypointEditorTool::onInitialize()
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(nh_->get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
+    waypoint_file_ = ExpandUserPath(nh_->declare_parameter<std::string>("waypoint_file", ""));
+    maps_directory_ = ExpandUserPath(nh_->declare_parameter<std::string>("maps_directory", "~/sahabat_ws/maps"));
+    map_id_ = nh_->declare_parameter<std::string>("map_id", "rdlfront");
+    const auto waypoint_sets_directory = ExpandUserPath(nh_->declare_parameter<std::string>("waypoint_sets_directory", ""));
+    backend_mode_ = nh_->declare_parameter<std::string>("waypoint_backend", "local");
+    map_directory_ = std::filesystem::path(maps_directory_);
+    if (waypoint_file_.empty()) {
+        waypoint_file_ = (map_directory_ / (map_id_ + "_waypoints.yaml")).string();
+    }
+    waypoint_sets_directory_ = waypoint_sets_directory.empty()
+        ? map_directory_ / "waypoint_sets" / map_id_
+        : std::filesystem::path(waypoint_sets_directory);
+    legacy_waypoint_sets_directory_ = map_directory_ / map_id_ / "waypoint_sets";
+    waypoint_index_path_ = waypoint_sets_directory_ / "index.yaml";
     auto_pose_topic_ = nh_->declare_parameter<std::string>("auto_pose_topic", "amcl_pose");
     auto_pose_type_  = nh_->declare_parameter<std::string>("auto_pose_type", "geometry_msgs/msg/PoseWithCovarianceStamped");
     auto_min_distance_m_ = nh_->declare_parameter<double>("auto_min_distance", 1.0);
+    marker_size_ = nh_->declare_parameter<double>("waypoint_marker_size", 0.25);
     param_cb_handle_ = nh_->add_on_set_parameters_callback(
         [this](const std::vector<rclcpp::Parameter> &params) {
             rcl_interfaces::msg::SetParametersResult result;
@@ -66,14 +146,36 @@ void WaypointEditorTool::onInitialize()
                         result.successful = false;
                         result.reason = "Unsupported auto_pose_type";
                     }
+                } else if (p.get_name() == "waypoint_marker_size") {
+                    const double value = p.as_double();
+                    if (value >= 0.10 && value <= 1.00) {
+                        marker_size_ = value;
+                    } else {
+                        result.successful = false;
+                        result.reason = "Waypoint marker size must be between 0.10 and 1.00 m";
+                    }
                 }
             }
             if (result.successful) {
                 refreshAutoPoseSubscription();
+                updateWaypointMarker();
+                publishRangeMetrics();
             }
             return result;
         }
     );
+
+    if (usingOperatorBackend()) {
+        backend_node_ = std::make_shared<rclcpp::Node>("waypoint_editor_operator_client");
+        backend_executor_ = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
+        backend_executor_->add_node(backend_node_);
+        backend_thread_ = std::thread([this]() { backend_executor_->spin(); });
+        operator_lease_client_ = backend_node_->create_client<sahabat_interfaces::srv::ControlLease>("/operator/control_lease");
+        operator_get_waypoints_client_ = backend_node_->create_client<sahabat_interfaces::srv::GetWaypoints>("/operator/waypoints/get");
+        operator_save_waypoints_client_ = backend_node_->create_client<sahabat_interfaces::srv::SaveWaypoints>("/operator/waypoints/save");
+        operator_list_sets_client_ = backend_node_->create_client<sahabat_interfaces::srv::ListWaypointSets>("/operator/waypoint_sets/list");
+        operator_manage_set_client_ = backend_node_->create_client<sahabat_interfaces::srv::ManageWaypointSet>("/operator/waypoint_sets/manage");
+    }
 
     server_ = std::make_shared<interactive_markers::InteractiveMarkerServer>(
         "interactive_marker_server",
@@ -100,6 +202,14 @@ void WaypointEditorTool::onInitialize()
     load_service_ = nh_->create_service<std_srvs::srv::Trigger>(
         "load_waypoints",
         std::bind(&WaypointEditorTool::handleLoadWaypoints, this, _1, _2)
+    );
+    list_sets_service_ = nh_->create_service<sahabat_interfaces::srv::ListWaypointSets>(
+        "waypoint_editor/list_sets",
+        std::bind(&WaypointEditorTool::handleListWaypointSets, this, _1, _2)
+    );
+    manage_set_service_ = nh_->create_service<sahabat_interfaces::srv::ManageWaypointSet>(
+        "waypoint_editor/manage_set",
+        std::bind(&WaypointEditorTool::handleManageWaypointSet, this, _1, _2)
     );
     auto_start_service_ = nh_->create_service<std_srvs::srv::Trigger>(
         "start_auto_waypoints",
@@ -132,8 +242,16 @@ void WaypointEditorTool::onInitialize()
     );
     refreshAutoPoseSubscription();
 
+    std::string error;
     waypoint_sequence_.clear();
     pose_dirty_ = false;
+    if (usingOperatorBackend()) {
+        if (!loadOperatorWaypointSet("", error)) {
+            RCLCPP_WARN(nh_->get_logger(), "Failed to initialize operator waypoint backend: %s", error.c_str());
+        }
+    } else if (!ensureWaypointSets(error) || !loadWaypointSet(activeSetFromIndex(), error)) {
+        RCLCPP_WARN(nh_->get_logger(), "Failed to initialize waypoint sets: %s", error.c_str());
+    }
     updateLastDistanceFromWaypoint(0);
     publishRangeMetrics();
 }
@@ -282,12 +400,13 @@ void WaypointEditorTool::refreshAutoPoseSubscription()
 visualization_msgs::msg::InteractiveMarker WaypointEditorTool::createWaypointMarker(const int id)
 {
     const auto & wp = waypoint_sequence_.at(id);
+    const double size = std::max(0.10, marker_size_);
 
     visualization_msgs::msg::InteractiveMarker int_marker;
     int_marker.header.frame_id = wp.pose.header.frame_id;
     int_marker.name = std::to_string(id);
     int_marker.description = waypoint_sequence_.at(id).function_command;
-    int_marker.scale = 1.0;
+    int_marker.scale = std::max(0.30, size * 2.5);
     int_marker.pose.position = wp.pose.pose.position;
     int_marker.pose.orientation.x = 0.0;
     int_marker.pose.orientation.y = 0.0;
@@ -306,9 +425,9 @@ visualization_msgs::msg::InteractiveMarker WaypointEditorTool::createWaypointMar
     {
         visualization_msgs::msg::Marker sphere;
         sphere.type = visualization_msgs::msg::Marker::SPHERE;
-        sphere.scale.x = 0.4;
-        sphere.scale.y = 0.4;
-        sphere.scale.z = 0.4;
+        sphere.scale.x = size;
+        sphere.scale.y = size;
+        sphere.scale.z = size;
         sphere.color.r = 0.0;
         sphere.color.g = 1.0;
         sphere.color.b = 0.0;
@@ -337,9 +456,9 @@ visualization_msgs::msg::InteractiveMarker WaypointEditorTool::createWaypointMar
     {
         visualization_msgs::msg::Marker arrow;
         arrow.type = visualization_msgs::msg::Marker::ARROW;
-        arrow.scale.x = 0.4;
-        arrow.scale.y = 0.1;
-        arrow.scale.z = 0.1;
+        arrow.scale.x = size;
+        arrow.scale.y = size * 0.25;
+        arrow.scale.z = size * 0.25;
         arrow.color.r = 1.0;
         arrow.color.g = 0.0;
         arrow.color.b = 0.0;
@@ -357,16 +476,16 @@ visualization_msgs::msg::InteractiveMarker WaypointEditorTool::createWaypointMar
     {
         visualization_msgs::msg::Marker text;
         text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
-        text.scale.z = 0.2;
+        text.scale.z = std::max(0.10, size * 0.55);
         text.color.r = 0.0;
         text.color.g = 0.0;
         text.color.b = 0.0;
         text.color.a = 1.0;
         std::string id_text = "ID:" + std::to_string(id) + "\n" + waypoint_sequence_.at(id).function_command;
         text.text = id_text;
-        text.pose.position.x = -0.3;
-        text.pose.position.y = -0.3;
-        text.pose.position.z = 0.3;
+        text.pose.position.x = -size * 0.75;
+        text.pose.position.y = -size * 0.75;
+        text.pose.position.z = size * 0.75;
         text_control.markers.push_back(text);
     }
     int_marker.controls.push_back(text_control);
@@ -386,13 +505,13 @@ visualization_msgs::msg::InteractiveMarker WaypointEditorTool::createWaypointMar
     visualization_msgs::msg::MenuEntry change_id_entry;
     change_id_entry.id = 2;
     change_id_entry.parent_id = 0;
-    change_id_entry.title = "Change Waypoint ID";
+    change_id_entry.title = "Reorder Waypoint";
     int_marker.menu_entries.push_back(change_id_entry);
     
     visualization_msgs::msg::MenuEntry add_function_command_entry;
     add_function_command_entry.id = 3;
     add_function_command_entry.parent_id = 0;
-    add_function_command_entry.title = "Edit Function Command";
+    add_function_command_entry.title = "Rename Waypoint";
     int_marker.menu_entries.push_back(add_function_command_entry);
 
     return int_marker;
@@ -460,15 +579,15 @@ void WaypointEditorTool::processMenuControl(const std::shared_ptr<const visualiz
             RCLCPP_INFO(nh_->get_logger(), "Deleted waypoint %d", id);
             break;
 
-        // Change Waypoint ID
+        // Reorder waypoint within the tour.
         case 2:
         {
          bool ok = false;
             QString current = QString::fromStdString(std::to_string(id));
             QString text = QInputDialog::getText(
                 nullptr,
-                tr("Change Waypoint ID"),
-                tr("Enter New Waypoint ID: %1").arg(id),
+                tr("Reorder Waypoint"),
+                tr("Move waypoint %1 to index:").arg(id),
                 QLineEdit::Normal,
                 current,
                 &ok
@@ -499,15 +618,15 @@ void WaypointEditorTool::processMenuControl(const std::shared_ptr<const visualiz
         }
             break;
 
-        // Add / Edit Function Command
+        // Rename waypoint.
         case 3:
         {
             bool ok = false;
             QString current = QString::fromStdString(waypoint_sequence_.at(static_cast<std::size_t>(id)).function_command);
             QString text = QInputDialog::getText(
                 nullptr,
-                tr("Edit Function Command"),
-                tr("Enter command for waypoint ID: %1").arg(id),
+                tr("Rename Waypoint"),
+                tr("Waypoint name:"),
                 QLineEdit::Normal,
                 current,
                 &ok
@@ -620,8 +739,416 @@ bool WaypointEditorTool::isValidWaypointId(int id) const
     return id >= 0 && id < static_cast<int>(waypoint_sequence_.size());
 }
 
+bool WaypointEditorTool::usingOperatorBackend() const
+{
+    return backend_mode_ == "operator" || backend_mode_ == "live" || backend_mode_ == "backend";
+}
+
+bool WaypointEditorTool::acquireOperatorLease(std::string &lease_id, std::string &error)
+{
+    if (!operator_lease_client_ || !operator_lease_client_->wait_for_service(std::chrono::seconds(2))) {
+        error = "Operator control lease service unavailable";
+        return false;
+    }
+    auto req = std::make_shared<sahabat_interfaces::srv::ControlLease::Request>();
+    req->action = sahabat_interfaces::srv::ControlLease::Request::ACQUIRE;
+    req->client_id = "rviz_waypoint_editor";
+    auto future = operator_lease_client_->async_send_request(req);
+    if (future.wait_for(std::chrono::seconds(3)) != std::future_status::ready) {
+        error = "Timed out acquiring operator control lease";
+        return false;
+    }
+    auto response = future.get();
+    if (!response->success) {
+        error = response->message;
+        return false;
+    }
+    lease_id = response->lease_id;
+    return true;
+}
+
+void WaypointEditorTool::releaseOperatorLease(const std::string &lease_id)
+{
+    if (lease_id.empty() || !operator_lease_client_) {
+        return;
+    }
+    auto req = std::make_shared<sahabat_interfaces::srv::ControlLease::Request>();
+    req->action = sahabat_interfaces::srv::ControlLease::Request::RELEASE;
+    req->client_id = "rviz_waypoint_editor";
+    req->lease_id = lease_id;
+    operator_lease_client_->async_send_request(req);
+}
+
+bool WaypointEditorTool::loadOperatorWaypointSet(const std::string &set_id, std::string &error)
+{
+    if (!operator_get_waypoints_client_ || !operator_get_waypoints_client_->wait_for_service(std::chrono::seconds(2))) {
+        error = "Operator waypoint load service unavailable";
+        return false;
+    }
+    auto req = std::make_shared<sahabat_interfaces::srv::GetWaypoints::Request>();
+    req->map_id = map_id_;
+    req->set_id = set_id;
+    auto future = operator_get_waypoints_client_->async_send_request(req);
+    if (future.wait_for(std::chrono::seconds(3)) != std::future_status::ready) {
+        error = "Timed out loading operator waypoints";
+        return false;
+    }
+    auto response = future.get();
+    if (response->set_id.empty()) {
+        error = response->message.empty() ? "Operator waypoint load failed" : response->message;
+        return false;
+    }
+
+    std::vector<Waypoint> loaded;
+    for (const auto &item : response->waypoints) {
+        Waypoint waypoint;
+        waypoint.pose.header.frame_id = "map";
+        waypoint.pose.header.stamp = nh_->now();
+        waypoint.pose.pose.position.x = item.pose.x;
+        waypoint.pose.pose.position.y = item.pose.y;
+        waypoint.pose.pose.position.z = 0.0;
+        tf2::Quaternion q;
+        q.setRPY(0.0, 0.0, item.pose.theta);
+        waypoint.pose.pose.orientation.x = 0.0;
+        waypoint.pose.pose.orientation.y = 0.0;
+        waypoint.pose.pose.orientation.z = q.z();
+        waypoint.pose.pose.orientation.w = q.w();
+        waypoint.function_command = item.name;
+        loaded.emplace_back(std::move(waypoint));
+    }
+
+    active_set_id_ = response->set_id;
+    active_set_name_ = response->set_id;
+    active_revision_ = static_cast<int>(response->revision);
+
+    if (operator_list_sets_client_ && operator_list_sets_client_->wait_for_service(std::chrono::milliseconds(500))) {
+        auto list_req = std::make_shared<sahabat_interfaces::srv::ListWaypointSets::Request>();
+        list_req->map_id = map_id_;
+        auto list_future = operator_list_sets_client_->async_send_request(list_req);
+        if (list_future.wait_for(std::chrono::seconds(2)) == std::future_status::ready) {
+            auto list_response = list_future.get();
+            for (const auto &info : list_response->sets) {
+                if (info.id == active_set_id_) {
+                    active_set_name_ = info.name;
+                    break;
+                }
+            }
+        }
+    }
+
+    waypoint_sequence_.assign(std::move(loaded));
+    waypoint_sequence_.resetHistory();
+    updateWaypointMarker();
+    commitWaypointChanges(static_cast<int>(waypoint_sequence_.size()) - 1, false);
+    error.clear();
+    return true;
+}
+
+bool WaypointEditorTool::saveOperatorWaypointSet(std::string &error)
+{
+    std::string lease_id;
+    if (!acquireOperatorLease(lease_id, error)) {
+        return false;
+    }
+    auto release = [this, &lease_id]() { releaseOperatorLease(lease_id); };
+    if (!operator_save_waypoints_client_ || !operator_save_waypoints_client_->wait_for_service(std::chrono::seconds(2))) {
+        error = "Operator waypoint save service unavailable";
+        release();
+        return false;
+    }
+    auto make_request = [this, &lease_id](uint64_t expected_revision) {
+        auto req = std::make_shared<sahabat_interfaces::srv::SaveWaypoints::Request>();
+        req->map_id = map_id_;
+        req->set_id = active_set_id_;
+        req->expected_revision = expected_revision;
+        req->lease_id = lease_id;
+        for (std::size_t i = 0; i < waypoint_sequence_.size(); ++i) {
+            const auto &wp = waypoint_sequence_.at(i);
+            sahabat_interfaces::msg::Waypoint item;
+            item.id = std::to_string(i);
+            item.name = wp.function_command.empty() ? "waypoint_" + std::to_string(i + 1) : wp.function_command;
+            item.pose.x = wp.pose.pose.position.x;
+            item.pose.y = wp.pose.pose.position.y;
+            item.pose.theta = YawFromPose(wp.pose.pose);
+            item.dwell_seconds = 0.0;
+            item.enabled = true;
+            req->waypoints.push_back(item);
+        }
+        return req;
+    };
+
+    auto req = make_request(static_cast<uint64_t>(std::max(0, active_revision_)));
+    auto future = operator_save_waypoints_client_->async_send_request(req);
+    if (future.wait_for(std::chrono::seconds(3)) != std::future_status::ready) {
+        error = "Timed out saving operator waypoints";
+        release();
+        return false;
+    }
+    auto response = future.get();
+    if (!response->success && response->revision != static_cast<uint64_t>(std::max(0, active_revision_))) {
+        active_revision_ = static_cast<int>(response->revision);
+        req = make_request(response->revision);
+        future = operator_save_waypoints_client_->async_send_request(req);
+        if (future.wait_for(std::chrono::seconds(3)) != std::future_status::ready) {
+            error = "Timed out retrying operator waypoint save";
+            release();
+            return false;
+        }
+        response = future.get();
+    }
+
+    release();
+    if (!response->success) {
+        active_revision_ = static_cast<int>(response->revision);
+        error = response->message;
+        return false;
+    }
+    active_set_id_ = response->set_id;
+    active_revision_ = static_cast<int>(response->revision);
+    error.clear();
+    return true;
+}
+
+std::vector<std::filesystem::path> WaypointEditorTool::waypointSetFiles() const
+{
+    std::vector<std::filesystem::path> files;
+    if (!std::filesystem::exists(waypoint_sets_directory_)) {
+        return files;
+    }
+    for (const auto &entry : std::filesystem::directory_iterator(waypoint_sets_directory_)) {
+        if (!entry.is_regular_file() || entry.path().extension() != ".yaml" || entry.path().filename() == "index.yaml") {
+            continue;
+        }
+        files.push_back(entry.path());
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+bool WaypointEditorTool::validSetId(const std::string &set_id) const
+{
+    static const std::regex valid("^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$");
+    return std::regex_match(set_id, valid);
+}
+
+std::string WaypointEditorTool::makeSetId(const std::string &name) const
+{
+    std::string result;
+    for (const auto ch : Trim(name)) {
+        if (std::isalnum(static_cast<unsigned char>(ch)) || ch == '_' || ch == '-') {
+            result.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        } else if (!result.empty() && result.back() != '-') {
+            result.push_back('-');
+        }
+    }
+    while (!result.empty() && (result.back() == '-' || result.back() == '_')) {
+        result.pop_back();
+    }
+    if (result.empty()) {
+        result = "set";
+    }
+    if (result.size() > 64) {
+        result.resize(64);
+    }
+    std::string candidate = result;
+    int suffix = 2;
+    while (std::filesystem::exists(waypoint_sets_directory_ / (candidate + ".yaml"))) {
+        const auto suffix_text = "-" + std::to_string(suffix++);
+        candidate = result.substr(0, std::min<std::size_t>(result.size(), 64 - suffix_text.size())) + suffix_text;
+    }
+    return candidate;
+}
+
+bool WaypointEditorTool::writeActiveSetIndex(const std::string &set_id, std::string &error) const
+{
+    try {
+        std::filesystem::create_directories(waypoint_sets_directory_);
+    } catch (const std::exception &ex) {
+        error = ex.what();
+        return false;
+    }
+    std::ofstream ofs(waypoint_index_path_);
+    if (!ofs.is_open()) {
+        error = "Failed to write " + waypoint_index_path_.string();
+        return false;
+    }
+    ofs << "active_set_id: " << set_id << "\n";
+    return true;
+}
+
+std::string WaypointEditorTool::activeSetFromIndex() const
+{
+    std::string selected;
+    try {
+        if (std::filesystem::exists(waypoint_index_path_)) {
+            YAML::Node index = YAML::LoadFile(waypoint_index_path_.string());
+            if (auto node = index["active_set_id"]; node && node.IsScalar()) {
+                selected = node.as<std::string>();
+            }
+        }
+    } catch (const YAML::Exception &) {
+        selected.clear();
+    }
+    if (validSetId(selected) && std::filesystem::exists(waypoint_sets_directory_ / (selected + ".yaml"))) {
+        return selected;
+    }
+    auto files = waypointSetFiles();
+    if (!files.empty()) {
+        return files.front().stem().string();
+    }
+    return "default";
+}
+
+bool WaypointEditorTool::writeWaypointSetFile(const std::string &set_id, const std::string &name, int revision, const std::vector<Waypoint> &waypoints, std::string &error) const
+{
+    if (!validSetId(set_id)) {
+        error = "Invalid waypoint set id: " + set_id;
+        return false;
+    }
+    try {
+        std::filesystem::create_directories(waypoint_sets_directory_);
+    } catch (const std::exception &ex) {
+        error = ex.what();
+        return false;
+    }
+    const auto path = waypoint_sets_directory_ / (set_id + ".yaml");
+    std::ofstream ofs(path);
+    if (!ofs.is_open()) {
+        error = "Failed to write " + path.string();
+        return false;
+    }
+    ofs << "name: \"" << EscapeYamlString(Trim(name).empty() ? set_id : Trim(name)) << "\"\n";
+    ofs << "revision: " << revision << "\n";
+    ofs << "waypoints:\n";
+    for (std::size_t i = 0; i < waypoints.size(); ++i) {
+        const auto &wp = waypoints[i];
+        const auto waypoint_name = wp.function_command.empty() ? "waypoint_" + std::to_string(i + 1) : wp.function_command;
+        ofs << "- id: \"" << i << "\"\n";
+        ofs << "  name: \"" << EscapeYamlString(waypoint_name) << "\"\n";
+        ofs << "  x: " << wp.pose.pose.position.x << "\n";
+        ofs << "  y: " << wp.pose.pose.position.y << "\n";
+        ofs << "  yaw: " << YawFromPose(wp.pose.pose) << "\n";
+        ofs << "  dwell_seconds: 0.0\n";
+        ofs << "  enabled: true\n";
+    }
+    error.clear();
+    return true;
+}
+
+bool WaypointEditorTool::ensureWaypointSets(std::string &error)
+{
+    try {
+        std::filesystem::create_directories(waypoint_sets_directory_);
+    } catch (const std::exception &ex) {
+        error = ex.what();
+        return false;
+    }
+    if (!waypointSetFiles().empty()) {
+        return true;
+    }
+
+    if (std::filesystem::exists(legacy_waypoint_sets_directory_)) {
+        try {
+            for (const auto &entry : std::filesystem::directory_iterator(legacy_waypoint_sets_directory_)) {
+                if (!entry.is_regular_file() || entry.path().extension() != ".yaml") {
+                    continue;
+                }
+                const auto destination = waypoint_sets_directory_ / entry.path().filename();
+                if (!std::filesystem::exists(destination)) {
+                    std::filesystem::copy_file(entry.path(), destination);
+                }
+            }
+        } catch (const std::exception &ex) {
+            error = ex.what();
+            return false;
+        }
+        if (!waypointSetFiles().empty()) {
+            return true;
+        }
+    }
+
+    std::vector<Waypoint> migrated;
+    if (!waypoint_file_.empty() && std::filesystem::exists(waypoint_file_)) {
+        std::string load_error;
+        if (!io::WaypointYaml::Load(waypoint_file_, migrated, load_error)) {
+            RCLCPP_WARN(nh_->get_logger(), "Could not migrate legacy waypoints: %s", load_error.c_str());
+        }
+    }
+    const auto accidental_legacy_file = map_directory_ / map_id_ / "waypoints.yaml";
+    if (migrated.empty() && std::filesystem::exists(accidental_legacy_file)) {
+        std::string load_error;
+        if (!io::WaypointYaml::Load(accidental_legacy_file.string(), migrated, load_error)) {
+            RCLCPP_WARN(nh_->get_logger(), "Could not migrate %s: %s", accidental_legacy_file.string().c_str(), load_error.c_str());
+        }
+    }
+    if (!writeWaypointSetFile("default", "Default", 0, migrated, error)) {
+        return false;
+    }
+    return writeActiveSetIndex("default", error);
+}
+
+bool WaypointEditorTool::loadWaypointSet(const std::string &set_id, std::string &error)
+{
+    if (!validSetId(set_id)) {
+        error = "Invalid waypoint set id: " + set_id;
+        return false;
+    }
+    const auto path = waypoint_sets_directory_ / (set_id + ".yaml");
+    if (!std::filesystem::exists(path)) {
+        error = "Waypoint set does not exist: " + set_id;
+        return false;
+    }
+    std::vector<Waypoint> loaded;
+    if (!io::WaypointYaml::Load(path.string(), loaded, error)) {
+        return false;
+    }
+    try {
+        YAML::Node root = YAML::LoadFile(path.string());
+        active_revision_ = root["revision"] ? root["revision"].as<int>() : 0;
+        active_set_name_ = root["name"] ? root["name"].as<std::string>() : set_id;
+    } catch (const YAML::Exception &) {
+        active_revision_ = 0;
+        active_set_name_ = set_id;
+    }
+    for (auto &wp : loaded) {
+        if (wp.pose.header.frame_id.empty()) {
+            wp.pose.header.frame_id = "map";
+        }
+        wp.pose.header.stamp = nh_->now();
+    }
+    active_set_id_ = set_id;
+    waypoint_sequence_.assign(std::move(loaded));
+    waypoint_sequence_.resetHistory();
+    updateWaypointMarker();
+    commitWaypointChanges(static_cast<int>(waypoint_sequence_.size()) - 1, false);
+    if (!writeActiveSetIndex(set_id, error)) {
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
+bool WaypointEditorTool::saveActiveWaypointSet(std::string &error)
+{
+    if (active_set_id_.empty()) {
+        active_set_id_ = activeSetFromIndex();
+    }
+    const int next_revision = active_revision_ + 1;
+    if (!writeWaypointSetFile(active_set_id_, active_set_name_, next_revision, waypoint_sequence_.waypoints(), error)) {
+        return false;
+    }
+    active_revision_ = next_revision;
+    return true;
+}
+
 bool WaypointEditorTool::requestFilePathForSaving(std::string &path, bool &save_as_yaml)
 {
+    if (!waypoint_file_.empty()) {
+        path = waypoint_file_;
+        save_as_yaml = true;
+        return true;
+    }
+
     QString selected_filter;
     QString qpath = QFileDialog::getSaveFileName(
         nullptr,
@@ -657,6 +1184,12 @@ bool WaypointEditorTool::requestFilePathForSaving(std::string &path, bool &save_
 
 bool WaypointEditorTool::requestFilePathForLoading(std::string &path, bool &load_yaml)
 {
+    if (!waypoint_file_.empty()) {
+        path = waypoint_file_;
+        load_yaml = true;
+        return true;
+    }
+
     QString selected_filter;
     QString qpath = QFileDialog::getOpenFileName(
         nullptr,
@@ -684,6 +1217,24 @@ bool WaypointEditorTool::requestFilePathForLoading(std::string &path, bool &load
 
 void WaypointEditorTool::handleSaveWaypoints(const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/, std::shared_ptr<std_srvs::srv::Trigger::Response> res)
 {
+    std::string error;
+    if (usingOperatorBackend()) {
+        if (saveOperatorWaypointSet(error)) {
+            res->success = true;
+            res->message = "Saved " + std::to_string(waypoint_sequence_.size()) + " waypoints to live set '" + active_set_name_ + "'";
+        } else {
+            res->success = false;
+            res->message = error;
+        }
+        return;
+    }
+
+    if (ensureWaypointSets(error) && saveActiveWaypointSet(error)) {
+        res->success = true;
+        res->message = "Saved " + std::to_string(waypoint_sequence_.size()) + " waypoints to set '" + active_set_name_ + "'";
+        return;
+    }
+
     std::string path;
     bool save_as_yaml = false;
     if (!requestFilePathForSaving(path, save_as_yaml)) {
@@ -692,7 +1243,6 @@ void WaypointEditorTool::handleSaveWaypoints(const std::shared_ptr<std_srvs::srv
         return;
     }
 
-    std::string error;
     bool ok = false;
     if (save_as_yaml) {
         ok = io::WaypointYaml::Save(waypoint_sequence_.waypoints(), path, error);
@@ -713,6 +1263,24 @@ void WaypointEditorTool::handleSaveWaypoints(const std::shared_ptr<std_srvs::srv
 
 void WaypointEditorTool::handleLoadWaypoints(const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/, std::shared_ptr<std_srvs::srv::Trigger::Response> res)
 {
+    std::string error;
+    if (usingOperatorBackend()) {
+        if (loadOperatorWaypointSet(active_set_id_, error)) {
+            res->success = true;
+            res->message = "Loaded " + std::to_string(waypoint_sequence_.size()) + " waypoints from live set '" + active_set_name_ + "'";
+        } else {
+            res->success = false;
+            res->message = error;
+        }
+        return;
+    }
+
+    if (ensureWaypointSets(error) && loadWaypointSet(active_set_id_.empty() ? activeSetFromIndex() : active_set_id_, error)) {
+        res->success = true;
+        res->message = "Loaded " + std::to_string(waypoint_sequence_.size()) + " waypoints from set '" + active_set_name_ + "'";
+        return;
+    }
+
     std::string path;
     bool load_yaml = false;
     if (!requestFilePathForLoading(path, load_yaml)) {
@@ -721,22 +1289,287 @@ void WaypointEditorTool::handleLoadWaypoints(const std::shared_ptr<std_srvs::srv
         return;
     }
 
-    std::vector<Waypoint> loaded;
-    std::string error;
-    bool ok = false;
-    if (load_yaml) {
-        ok = io::WaypointYaml::Load(path, loaded, error);
-    } else {
-        ok = io::WaypointCsv::Load(path, loaded, error);
-    }
-
-    if (!ok) {
+    if (!loadWaypointsFromPath(path, load_yaml, error)) {
         QMessageBox::warning(nullptr, tr("Error"), tr("Cannot open file:\n%1").arg(QString::fromStdString(path)));
         res->success = false;
         res->message = error;
         return;
     }
 
+    res->success = true;
+    res->message = "Loaded " + std::to_string(waypoint_sequence_.size()) + " waypoints from " + path;
+}
+
+void WaypointEditorTool::handleListWaypointSets(
+    const std::shared_ptr<sahabat_interfaces::srv::ListWaypointSets::Request> /*req*/,
+    std::shared_ptr<sahabat_interfaces::srv::ListWaypointSets::Response> res)
+{
+    if (usingOperatorBackend()) {
+        if (!operator_list_sets_client_ || !operator_list_sets_client_->wait_for_service(std::chrono::seconds(2))) {
+            res->message = "Operator waypoint-set list service unavailable";
+            return;
+        }
+        auto req = std::make_shared<sahabat_interfaces::srv::ListWaypointSets::Request>();
+        req->map_id = map_id_;
+        auto future = operator_list_sets_client_->async_send_request(req);
+        if (future.wait_for(std::chrono::seconds(3)) != std::future_status::ready) {
+            res->message = "Timed out listing operator waypoint sets";
+            return;
+        }
+        auto response = future.get();
+        res->sets = response->sets;
+        res->active_set_id = response->active_set_id;
+        res->has_dock = response->has_dock;
+        res->dock = response->dock;
+        res->message = response->message;
+        return;
+    }
+
+    std::string error;
+    if (!ensureWaypointSets(error)) {
+        res->message = error;
+        return;
+    }
+    const auto active = active_set_id_.empty() ? activeSetFromIndex() : active_set_id_;
+    res->active_set_id = active;
+    for (const auto &path : waypointSetFiles()) {
+        YAML::Node root;
+        try {
+            root = YAML::LoadFile(path.string());
+        } catch (const YAML::Exception &) {
+            continue;
+        }
+        sahabat_interfaces::msg::WaypointSetInfo info;
+        info.id = path.stem().string();
+        info.name = root["name"] ? root["name"].as<std::string>() : info.id;
+        info.revision = root["revision"] ? static_cast<uint64_t>(std::max(0, root["revision"].as<int>())) : 0;
+        info.waypoint_count = root["waypoints"] && root["waypoints"].IsSequence()
+            ? static_cast<uint32_t>(root["waypoints"].size())
+            : 0;
+        res->sets.push_back(info);
+    }
+    res->message = std::to_string(res->sets.size()) + " waypoint set(s) loaded";
+}
+
+void WaypointEditorTool::handleManageWaypointSet(
+    const std::shared_ptr<sahabat_interfaces::srv::ManageWaypointSet::Request> req,
+    std::shared_ptr<sahabat_interfaces::srv::ManageWaypointSet::Response> res)
+{
+    if (usingOperatorBackend()) {
+        std::string error;
+        std::string lease_id;
+        if (!acquireOperatorLease(lease_id, error)) {
+            res->message = error;
+            return;
+        }
+        auto release = [this, &lease_id]() { releaseOperatorLease(lease_id); };
+        if (!operator_manage_set_client_ || !operator_manage_set_client_->wait_for_service(std::chrono::seconds(2))) {
+            res->message = "Operator waypoint-set manage service unavailable";
+            release();
+            return;
+        }
+        auto manage_req = std::make_shared<sahabat_interfaces::srv::ManageWaypointSet::Request>();
+        manage_req->action = req->action;
+        manage_req->map_id = map_id_;
+        manage_req->set_id = req->set_id;
+        manage_req->name = req->name;
+        manage_req->lease_id = lease_id;
+        auto future = operator_manage_set_client_->async_send_request(manage_req);
+        if (future.wait_for(std::chrono::seconds(3)) != std::future_status::ready) {
+            res->message = "Timed out managing operator waypoint set";
+            release();
+            return;
+        }
+        auto response = future.get();
+        res->success = response->success;
+        res->set_id = response->set_id;
+        res->active_set_id = response->active_set_id;
+        res->message = response->message;
+        if (!response->success) {
+            release();
+            return;
+        }
+
+        if (req->action == sahabat_interfaces::srv::ManageWaypointSet::Request::CREATE) {
+            const std::string previous_set = active_set_id_;
+            const int previous_revision = active_revision_;
+            active_set_id_ = response->set_id;
+            active_set_name_ = Trim(req->name).empty() ? response->set_id : Trim(req->name);
+            active_revision_ = 0;
+            if (!operator_save_waypoints_client_ || !operator_save_waypoints_client_->wait_for_service(std::chrono::seconds(2))) {
+                active_set_id_ = previous_set;
+                active_revision_ = previous_revision;
+                res->success = false;
+                res->message = "Operator waypoint save service unavailable";
+                release();
+                return;
+            }
+            auto save_req = std::make_shared<sahabat_interfaces::srv::SaveWaypoints::Request>();
+            save_req->map_id = map_id_;
+            save_req->set_id = active_set_id_;
+            save_req->expected_revision = 0;
+            save_req->lease_id = lease_id;
+            for (std::size_t i = 0; i < waypoint_sequence_.size(); ++i) {
+                const auto &wp = waypoint_sequence_.at(i);
+                sahabat_interfaces::msg::Waypoint item;
+                item.id = std::to_string(i);
+                item.name = wp.function_command.empty() ? "waypoint_" + std::to_string(i + 1) : wp.function_command;
+                item.pose.x = wp.pose.pose.position.x;
+                item.pose.y = wp.pose.pose.position.y;
+                item.pose.theta = YawFromPose(wp.pose.pose);
+                item.dwell_seconds = 0.0;
+                item.enabled = true;
+                save_req->waypoints.push_back(item);
+            }
+            auto save_future = operator_save_waypoints_client_->async_send_request(save_req);
+            if (save_future.wait_for(std::chrono::seconds(3)) != std::future_status::ready) {
+                active_set_id_ = previous_set;
+                active_revision_ = previous_revision;
+                res->success = false;
+                res->message = "Timed out saving current waypoints to new live set";
+                release();
+                return;
+            }
+            auto save_response = save_future.get();
+            if (!save_response->success) {
+                active_set_id_ = previous_set;
+                active_revision_ = previous_revision;
+                res->success = false;
+                res->message = save_response->message;
+                release();
+                return;
+            }
+            active_revision_ = static_cast<int>(save_response->revision);
+            res->message = "Saved current waypoints as live set '" + active_set_name_ + "'";
+        } else if (req->action == sahabat_interfaces::srv::ManageWaypointSet::Request::SELECT ||
+                   req->action == sahabat_interfaces::srv::ManageWaypointSet::Request::DELETE) {
+            std::string load_error;
+            if (!loadOperatorWaypointSet(response->active_set_id.empty() ? response->set_id : response->active_set_id, load_error)) {
+                res->message = response->message + "; reload failed: " + load_error;
+            }
+        } else if (req->action == sahabat_interfaces::srv::ManageWaypointSet::Request::RENAME) {
+            if (response->set_id == active_set_id_) {
+                active_set_name_ = Trim(req->name).empty() ? active_set_id_ : Trim(req->name);
+            }
+        }
+        release();
+        return;
+    }
+
+    std::string error;
+    if (!ensureWaypointSets(error)) {
+        res->message = error;
+        return;
+    }
+
+    try {
+        if (req->action == sahabat_interfaces::srv::ManageWaypointSet::Request::CREATE) {
+            const std::string name = Trim(req->name).empty() ? "Untitled set" : Trim(req->name);
+            const auto set_id = makeSetId(name);
+            if (!writeWaypointSetFile(set_id, name, 0, waypoint_sequence_.waypoints(), error) || !loadWaypointSet(set_id, error)) {
+                res->message = error;
+                return;
+            }
+            res->set_id = set_id;
+            res->message = "Saved current waypoints as set '" + name + "'";
+        } else if (req->action == sahabat_interfaces::srv::ManageWaypointSet::Request::RENAME) {
+            const auto set_id = req->set_id.empty() ? active_set_id_ : req->set_id;
+            if (!validSetId(set_id)) {
+                res->message = "Invalid waypoint set id";
+                return;
+            }
+            const auto path = waypoint_sets_directory_ / (set_id + ".yaml");
+            if (!std::filesystem::exists(path)) {
+                res->message = "Waypoint set does not exist: " + set_id;
+                return;
+            }
+            std::vector<Waypoint> loaded;
+            if (!io::WaypointYaml::Load(path.string(), loaded, error)) {
+                res->message = error;
+                return;
+            }
+            int revision = 0;
+            try {
+                YAML::Node root = YAML::LoadFile(path.string());
+                revision = root["revision"] ? root["revision"].as<int>() : 0;
+            } catch (const YAML::Exception &) {
+                revision = 0;
+            }
+            const std::string name = Trim(req->name).empty() ? set_id : Trim(req->name);
+            if (!writeWaypointSetFile(set_id, name, revision, loaded, error)) {
+                res->message = error;
+                return;
+            }
+            if (set_id == active_set_id_) {
+                active_set_name_ = name;
+            }
+            res->set_id = set_id;
+            res->message = "Renamed waypoint set";
+        } else if (req->action == sahabat_interfaces::srv::ManageWaypointSet::Request::DELETE) {
+            const auto files = waypointSetFiles();
+            if (files.size() <= 1) {
+                res->message = "A map must keep at least one waypoint set";
+                return;
+            }
+            const auto set_id = req->set_id.empty() ? active_set_id_ : req->set_id;
+            if (!validSetId(set_id)) {
+                res->message = "Invalid waypoint set id";
+                return;
+            }
+            const auto path = waypoint_sets_directory_ / (set_id + ".yaml");
+            if (!std::filesystem::exists(path)) {
+                res->message = "Waypoint set does not exist: " + set_id;
+                return;
+            }
+            const auto archive = waypoint_sets_directory_ / "archive";
+            std::filesystem::create_directories(archive);
+            auto destination = archive / (set_id + "-archived.yaml");
+            int archive_suffix = 2;
+            while (std::filesystem::exists(destination)) {
+                destination = archive / (set_id + "-archived-" + std::to_string(archive_suffix++) + ".yaml");
+            }
+            std::filesystem::rename(path, destination);
+            auto remaining = waypointSetFiles();
+            const auto next_set = remaining.empty() ? "default" : remaining.front().stem().string();
+            if (!loadWaypointSet(next_set, error)) {
+                res->message = error;
+                return;
+            }
+            res->set_id = set_id;
+            res->message = "Archived waypoint set";
+        } else if (req->action == sahabat_interfaces::srv::ManageWaypointSet::Request::SELECT) {
+            const auto set_id = req->set_id.empty() ? activeSetFromIndex() : req->set_id;
+            if (!loadWaypointSet(set_id, error)) {
+                res->message = error;
+                return;
+            }
+            res->set_id = set_id;
+            res->message = "Loaded waypoint set '" + active_set_name_ + "'";
+        } else {
+            res->message = "Unknown waypoint-set action";
+            return;
+        }
+    } catch (const std::exception &ex) {
+        res->message = ex.what();
+        return;
+    }
+
+    res->active_set_id = active_set_id_;
+    res->success = true;
+}
+
+bool WaypointEditorTool::loadWaypointsFromPath(const std::string &path, bool load_yaml, std::string &error)
+{
+    std::vector<Waypoint> loaded;
+    bool ok = false;
+    if (load_yaml) {
+        ok = io::WaypointYaml::Load(path, loaded, error);
+    } else {
+        ok = io::WaypointCsv::Load(path, loaded, error);
+    }
+    if (!ok) {
+        return false;
+    }
     for (auto &wp : loaded) {
         if (wp.pose.header.frame_id.empty()) {
             wp.pose.header.frame_id = "map";
@@ -746,9 +1579,7 @@ void WaypointEditorTool::handleLoadWaypoints(const std::shared_ptr<std_srvs::srv
     waypoint_sequence_.assign(std::move(loaded));
     updateWaypointMarker();
     commitWaypointChanges(static_cast<int>(waypoint_sequence_.size()) - 1);
-
-    res->success = true;
-    res->message = "Loaded " + std::to_string(waypoint_sequence_.size()) + " waypoints from " + path;
+    return true;
 }
 
 void WaypointEditorTool::handleUndoWaypoints(const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/, std::shared_ptr<std_srvs::srv::Trigger::Response> res)

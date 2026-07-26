@@ -23,6 +23,14 @@
 #include <QLineEdit>
 #include <QComboBox>
 #include <QGroupBox>
+#include <QInputDialog>
+#include <QMessageBox>
+#include <QVariant>
+#include <QDir>
+#include <QFileInfo>
+#include <QScrollArea>
+#include <QFrame>
+#include <QWidget>
 
 #include <chrono>
 
@@ -30,6 +38,19 @@
 
 namespace waypoint_editor
 {
+
+namespace
+{
+
+QString expandUserPath(QString path)
+{
+    if (path.startsWith("~/")) {
+        return QDir::homePath() + path.mid(1);
+    }
+    return path;
+}
+
+}  // namespace
 
 WaypointEditorPanel::WaypointEditorPanel(QWidget *parent) : rviz_common::Panel(parent)
 {
@@ -130,6 +151,16 @@ WaypointEditorPanel::WaypointEditorPanel(QWidget *parent) : rviz_common::Panel(p
     load_3d_map_button_    = new QPushButton("Load 3D Map", this);
     load_waypoints_button_ = new QPushButton("Load WPs", this);
     save_waypoints_button_ = new QPushButton("Save WPs", this);
+    waypoint_set_combo_    = new QComboBox(this);
+    refresh_sets_button_   = new QPushButton("Refresh", this);
+    new_set_button_        = new QPushButton("Save As Set", this);
+    rename_set_button_     = new QPushButton("Rename Set", this);
+    delete_set_button_     = new QPushButton("Delete Set", this);
+    waypoint_combo_        = new QComboBox(this);
+    refresh_waypoints_button_ = new QPushButton("Refresh", this);
+    go_waypoint_button_    = new QPushButton("Go", this);
+    stop_navigation_button_= new QPushButton("Stop", this);
+    marker_size_spin_      = new QDoubleSpinBox(this);
     undo_button_           = new QPushButton("Undo", this);
     redo_button_           = new QPushButton("Redo", this);
     clear_button_          = new QPushButton("Clear All", this);
@@ -147,6 +178,24 @@ WaypointEditorPanel::WaypointEditorPanel(QWidget *parent) : rviz_common::Panel(p
     clear_button_->setMinimumWidth(80);
     clear_button_->setStyleSheet(""); // match other buttons
 
+    waypoint_set_combo_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    waypoint_combo_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    marker_size_spin_->setDecimals(2);
+    marker_size_spin_->setRange(0.10, 1.00);
+    marker_size_spin_->setSingleStep(0.05);
+    marker_size_spin_->setValue(0.25);
+    marker_size_spin_->setSuffix(" m");
+    marker_size_spin_->setMaximumWidth(90);
+    for (auto *btn : {refresh_sets_button_, new_set_button_, rename_set_button_, delete_set_button_}) {
+        btn->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
+        btn->setMinimumWidth(76);
+    }
+    for (auto *btn : {refresh_waypoints_button_, go_waypoint_button_, stop_navigation_button_}) {
+        btn->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
+        btn->setMinimumWidth(64);
+    }
+    go_waypoint_button_->setStyleSheet("font-weight: bold;");
+
     // Map section
     QHBoxLayout *map_row = new QHBoxLayout;
     map_row->setContentsMargins(6, 6, 6, 6);
@@ -159,9 +208,68 @@ WaypointEditorPanel::WaypointEditorPanel(QWidget *parent) : rviz_common::Panel(p
     map_group->setLayout(map_row);
     map_group->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Minimum);
 
-    // Waypoints section
+    // Waypoint set section
+    QHBoxLayout *set_row = new QHBoxLayout;
+    set_row->setContentsMargins(6, 6, 6, 0);
+    set_row->setSpacing(8);
+    set_row->addWidget(new QLabel("Set", this));
+    set_row->addWidget(waypoint_set_combo_, /*stretch=*/1);
+    set_row->addWidget(refresh_sets_button_, /*stretch=*/0);
+
+    QHBoxLayout *set_actions_row = new QHBoxLayout;
+    set_actions_row->setContentsMargins(6, 0, 6, 0);
+    set_actions_row->setSpacing(8);
+    set_actions_row->addWidget(new_set_button_, /*stretch=*/1);
+    set_actions_row->addWidget(rename_set_button_, /*stretch=*/1);
+    set_actions_row->addWidget(delete_set_button_, /*stretch=*/1);
+
+    QVBoxLayout *set_layout = new QVBoxLayout;
+    set_layout->setContentsMargins(0, 0, 0, 0);
+    set_layout->setSpacing(4);
+    set_layout->addLayout(set_row);
+    set_layout->addLayout(set_actions_row);
+
+    QGroupBox *set_group = new QGroupBox(tr("Waypoint Set"), this);
+    set_group->setFont(smallFont);
+    set_group->setStyleSheet("QGroupBox::title { font-weight: bold; }");
+    set_group->setLayout(set_layout);
+    set_group->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Minimum);
+
+    // Live navigation section
+    QHBoxLayout *goto_row = new QHBoxLayout;
+    goto_row->setContentsMargins(6, 6, 6, 0);
+    goto_row->setSpacing(8);
+    goto_row->addWidget(new QLabel("Waypoint", this));
+    goto_row->addWidget(waypoint_combo_, /*stretch=*/1);
+    goto_row->addWidget(refresh_waypoints_button_, /*stretch=*/0);
+
+    QHBoxLayout *goto_actions_row = new QHBoxLayout;
+    goto_actions_row->setContentsMargins(6, 0, 6, 6);
+    goto_actions_row->setSpacing(8);
+    goto_actions_row->addWidget(go_waypoint_button_, /*stretch=*/1);
+    goto_actions_row->addWidget(stop_navigation_button_, /*stretch=*/1);
+
+    QVBoxLayout *goto_layout = new QVBoxLayout;
+    goto_layout->setContentsMargins(0, 0, 0, 0);
+    goto_layout->setSpacing(4);
+    goto_layout->addLayout(goto_row);
+    goto_layout->addLayout(goto_actions_row);
+
+    QGroupBox *goto_group = new QGroupBox(tr("Live Navigation"), this);
+    goto_group->setFont(smallFont);
+    goto_group->setStyleSheet("QGroupBox::title { font-weight: bold; }");
+    goto_group->setLayout(goto_layout);
+    goto_group->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Minimum);
+
+    QHBoxLayout *marker_size_row = new QHBoxLayout;
+    marker_size_row->setContentsMargins(6, 0, 6, 0);
+    marker_size_row->setSpacing(8);
+    marker_size_row->addWidget(new QLabel("Marker size", this));
+    marker_size_row->addWidget(marker_size_spin_, /*stretch=*/0);
+    marker_size_row->addStretch();
+
     QHBoxLayout *wp_row1 = new QHBoxLayout;
-    wp_row1->setContentsMargins(6, 6, 6, 0);
+    wp_row1->setContentsMargins(6, 0, 6, 0);
     wp_row1->setSpacing(8);
     wp_row1->addWidget(undo_button_, /*stretch=*/1);
     wp_row1->addWidget(redo_button_, /*stretch=*/1);
@@ -176,10 +284,11 @@ WaypointEditorPanel::WaypointEditorPanel(QWidget *parent) : rviz_common::Panel(p
     QVBoxLayout *wp_layout = new QVBoxLayout;
     wp_layout->setContentsMargins(0, 0, 0, 0);
     wp_layout->setSpacing(4);
-    wp_layout->addLayout(wp_row1);
     wp_layout->addLayout(wp_row2);
+    wp_layout->addLayout(wp_row1);
+    wp_layout->addLayout(marker_size_row);
 
-    QGroupBox *action_group = new QGroupBox(tr("Waypoints"), this);
+    QGroupBox *action_group = new QGroupBox(tr("Edit Waypoints"), this);
     action_group->setFont(smallFont);
     action_group->setStyleSheet("QGroupBox::title { font-weight: bold; }");
     action_group->setLayout(wp_layout);
@@ -257,19 +366,46 @@ WaypointEditorPanel::WaypointEditorPanel(QWidget *parent) : rviz_common::Panel(p
     layout_->addSpacing(8);
     layout_->addWidget(map_group);
     layout_->addSpacing(6);
+    layout_->addWidget(set_group);
+    layout_->addSpacing(6);
+    layout_->addWidget(goto_group);
+    layout_->addSpacing(6);
     layout_->addWidget(action_group);
     layout_->addSpacing(6);
     layout_->addWidget(auto_group);
     layout_->addStretch();
 
-    setLayout(layout_);
-    setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
+    QWidget *content_widget = new QWidget(this);
+    content_widget->setLayout(layout_);
+
+    QScrollArea *scroll_area = new QScrollArea(this);
+    scroll_area->setWidget(content_widget);
+    scroll_area->setWidgetResizable(true);
+    scroll_area->setFrameShape(QFrame::NoFrame);
+    scroll_area->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+
+    QVBoxLayout *root_layout = new QVBoxLayout;
+    root_layout->setContentsMargins(0, 0, 0, 0);
+    root_layout->addWidget(scroll_area);
+    setLayout(root_layout);
+    setMinimumWidth(320);
+    setMaximumWidth(430);
+    setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
 
     // Connect signals
     connect(load_2d_map_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onLoad2DMapButtonClick);
     connect(load_3d_map_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onLoad3DMapButtonClick);
     connect(load_waypoints_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onLoadWaypointsButtonClick);
     connect(save_waypoints_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onSaveWaypointsButtonClick);
+    connect(waypoint_set_combo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &WaypointEditorPanel::onWaypointSetSelected);
+    connect(refresh_sets_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onRefreshSetsButtonClick);
+    connect(new_set_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onNewSetButtonClick);
+    connect(rename_set_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onRenameSetButtonClick);
+    connect(delete_set_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onDeleteSetButtonClick);
+    connect(refresh_waypoints_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onRefreshWaypointsButtonClick);
+    connect(go_waypoint_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onGoToWaypointButtonClick);
+    connect(stop_navigation_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onStopNavigationButtonClick);
+    connect(marker_size_spin_, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &WaypointEditorPanel::onMarkerSizeChanged);
     connect(undo_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onUndoWaypointsButtonClick);
     connect(redo_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onRedoWaypointsButtonClick);
     connect(clear_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onClearWaypointsButtonClick);
@@ -281,7 +417,7 @@ WaypointEditorPanel::~WaypointEditorPanel() {}
 void WaypointEditorPanel::onInitialize()
 {
     nh_               = this->getDisplayContext()->getRosNodeAbstraction().lock()->get_raw_node();
-    load_map_client_  = nh_->create_client<nav2_msgs::srv::LoadMap>("map_server/load_map");
+    load_map_client_  = nh_->create_client<sahabat_interfaces::srv::LoadMap>("/operator/maps/load");
     load_client_      = nh_->create_client<std_srvs::srv::Trigger>("load_waypoints");
     save_client_      = nh_->create_client<std_srvs::srv::Trigger>("save_waypoints");
     undo_client_      = nh_->create_client<std_srvs::srv::Trigger>("undo_waypoints");
@@ -289,6 +425,11 @@ void WaypointEditorPanel::onInitialize()
     clear_client_     = nh_->create_client<std_srvs::srv::Trigger>("clear_waypoints");
     auto_start_client_= nh_->create_client<std_srvs::srv::Trigger>("start_auto_waypoints");
     auto_stop_client_ = nh_->create_client<std_srvs::srv::Trigger>("stop_auto_waypoints");
+    list_sets_client_ = nh_->create_client<sahabat_interfaces::srv::ListWaypointSets>("waypoint_editor/list_sets");
+    manage_set_client_= nh_->create_client<sahabat_interfaces::srv::ManageWaypointSet>("waypoint_editor/manage_set");
+    get_waypoints_client_ = nh_->create_client<sahabat_interfaces::srv::GetWaypoints>("/operator/waypoints/get");
+    control_lease_client_ = nh_->create_client<sahabat_interfaces::srv::ControlLease>("/operator/control_lease");
+    patrol_client_ = nh_->create_client<sahabat_interfaces::srv::PatrolCommand>("/operator/patrol");
     auto_distance_pub_= nh_->create_publisher<std_msgs::msg::Float64>("auto_waypoint_min_distance", rclcpp::QoS(1).transient_local());
 
     last_wp_dist_sub_ = nh_->create_subscription<std_msgs::msg::Float64>(
@@ -306,6 +447,18 @@ void WaypointEditorPanel::onInitialize()
     );
     
     cloud_pub_ = nh_->create_publisher<sensor_msgs::msg::PointCloud2>("map_cloud", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable());
+    std::string maps_directory = "~/sahabat_ws/maps";
+    std::string map_id = "rdlfront";
+    nh_->get_parameter("maps_directory", maps_directory);
+    nh_->get_parameter("map_id", map_id);
+    map_id_ = QString::fromStdString(map_id);
+    map_dialog_directory_ = expandUserPath(QString::fromStdString(maps_directory));
+    double marker_size = marker_size_spin_->value();
+    if (nh_->get_parameter("waypoint_marker_size", marker_size)) {
+        marker_size_spin_->setValue(marker_size);
+    }
+    refreshWaypointSets();
+    refreshWaypoints();
 }
 
 void WaypointEditorPanel::load(const rviz_common::Config &config)
@@ -316,6 +469,254 @@ void WaypointEditorPanel::load(const rviz_common::Config &config)
 void WaypointEditorPanel::save(rviz_common::Config config) const
 {
   rviz_common::Panel::save(config);
+}
+
+void WaypointEditorPanel::refreshWaypointSets()
+{
+    if (!list_sets_client_ || !list_sets_client_->wait_for_service(std::chrono::milliseconds(500))) {
+        postStatusMessage(tr("Waypoint-set service unavailable"));
+        return;
+    }
+
+    auto req = std::make_shared<sahabat_interfaces::srv::ListWaypointSets::Request>();
+    list_sets_client_->async_send_request(req,
+        [this](rclcpp::Client<sahabat_interfaces::srv::ListWaypointSets>::SharedFuture future) {
+            try {
+                auto response = future.get();
+                QMetaObject::invokeMethod(this, [this, response]() {
+                    QSignalBlocker blocker(waypoint_set_combo_);
+                    waypoint_set_combo_->clear();
+                    int active_index = -1;
+                    for (int i = 0; i < static_cast<int>(response->sets.size()); ++i) {
+                        const auto &set = response->sets[static_cast<std::size_t>(i)];
+                        const QString id = QString::fromStdString(set.id);
+                        const QString label = QString::fromStdString(set.name);
+                        waypoint_set_combo_->addItem(label, id);
+                        if (set.id == response->active_set_id) {
+                            active_index = i;
+                        }
+                    }
+                    if (active_index >= 0) {
+                        waypoint_set_combo_->setCurrentIndex(active_index);
+                    }
+                    postStatusMessage(QString::fromStdString(response->message));
+                    refreshWaypoints();
+                }, Qt::QueuedConnection);
+            } catch (...) {
+                postStatusMessage(tr("Failed to refresh waypoint sets"));
+            }
+        });
+}
+
+void WaypointEditorPanel::manageWaypointSet(uint8_t action, const QString &set_id, const QString &name)
+{
+    if (!manage_set_client_ || !manage_set_client_->wait_for_service(std::chrono::seconds(1))) {
+        postStatusMessage(tr("Waypoint-set service unavailable"));
+        return;
+    }
+
+    auto req = std::make_shared<sahabat_interfaces::srv::ManageWaypointSet::Request>();
+    req->action = action;
+    req->set_id = set_id.toStdString();
+    req->name = name.toStdString();
+    manage_set_client_->async_send_request(req,
+        [this, action](rclcpp::Client<sahabat_interfaces::srv::ManageWaypointSet>::SharedFuture future) {
+            try {
+                auto response = future.get();
+                postStatusMessage(QString::fromStdString(response->message));
+                if (response->success) {
+                    refreshWaypointSets();
+                    if (action == sahabat_interfaces::srv::ManageWaypointSet::Request::SELECT) {
+                        refreshWaypoints();
+                    }
+                }
+            } catch (...) {
+                postStatusMessage(tr("Waypoint-set action failed"));
+            }
+        });
+}
+
+void WaypointEditorPanel::onWaypointSetSelected(int index)
+{
+    if (index < 0) {
+        return;
+    }
+    manageWaypointSet(
+        sahabat_interfaces::srv::ManageWaypointSet::Request::SELECT,
+        waypoint_set_combo_->itemData(index).toString(),
+        QString());
+}
+
+void WaypointEditorPanel::onRefreshSetsButtonClick()
+{
+    refreshWaypointSets();
+}
+
+void WaypointEditorPanel::refreshWaypoints()
+{
+    if (!get_waypoints_client_ || !get_waypoints_client_->wait_for_service(std::chrono::milliseconds(300))) {
+        QSignalBlocker blocker(waypoint_combo_);
+        waypoint_combo_->clear();
+        return;
+    }
+
+    auto req = std::make_shared<sahabat_interfaces::srv::GetWaypoints::Request>();
+    req->map_id = map_id_.toStdString();
+    req->set_id = waypoint_set_combo_->currentData().toString().toStdString();
+    get_waypoints_client_->async_send_request(req,
+        [this](rclcpp::Client<sahabat_interfaces::srv::GetWaypoints>::SharedFuture future) {
+            try {
+                auto response = future.get();
+                QMetaObject::invokeMethod(this, [this, response]() {
+                    QSignalBlocker blocker(waypoint_combo_);
+                    waypoint_combo_->clear();
+                    for (const auto &waypoint : response->waypoints) {
+                        const QString label = QString::fromStdString(waypoint.name.empty() ? waypoint.id : waypoint.name);
+                        waypoint_combo_->addItem(label, QString::fromStdString(waypoint.id));
+                    }
+                }, Qt::QueuedConnection);
+            } catch (...) {
+                postStatusMessage(tr("Failed to refresh waypoints"));
+            }
+        });
+}
+
+void WaypointEditorPanel::onRefreshWaypointsButtonClick()
+{
+    refreshWaypoints();
+}
+
+void WaypointEditorPanel::releaseControlLease(const std::string &lease_id)
+{
+    if (lease_id.empty() || !control_lease_client_) {
+        return;
+    }
+    auto req = std::make_shared<sahabat_interfaces::srv::ControlLease::Request>();
+    req->action = sahabat_interfaces::srv::ControlLease::Request::RELEASE;
+    req->client_id = "rviz_waypoint_editor_panel";
+    req->lease_id = lease_id;
+    control_lease_client_->async_send_request(req);
+}
+
+void WaypointEditorPanel::sendPatrolCommand(uint8_t command, const QString &waypoint_id)
+{
+    if (!control_lease_client_ || !patrol_client_) {
+        postStatusMessage(tr("Operator services unavailable"));
+        return;
+    }
+    if (!control_lease_client_->wait_for_service(std::chrono::milliseconds(500)) ||
+        !patrol_client_->wait_for_service(std::chrono::milliseconds(500))) {
+        postStatusMessage(tr("Operator services unavailable"));
+        return;
+    }
+
+    auto lease_req = std::make_shared<sahabat_interfaces::srv::ControlLease::Request>();
+    lease_req->action = sahabat_interfaces::srv::ControlLease::Request::ACQUIRE;
+    lease_req->client_id = "rviz_waypoint_editor_panel";
+    control_lease_client_->async_send_request(lease_req,
+        [this, command, waypoint_id](rclcpp::Client<sahabat_interfaces::srv::ControlLease>::SharedFuture lease_future) {
+            auto lease = lease_future.get();
+            if (!lease->success) {
+                postStatusMessage(QString::fromStdString(lease->message));
+                return;
+            }
+
+            auto req = std::make_shared<sahabat_interfaces::srv::PatrolCommand::Request>();
+            req->command = command;
+            req->set_id = waypoint_set_combo_->currentData().toString().toStdString();
+            req->waypoint_id = waypoint_id.toStdString();
+            req->loop = false;
+            req->lease_id = lease->lease_id;
+            patrol_client_->async_send_request(req,
+                [this, lease_id = lease->lease_id](rclcpp::Client<sahabat_interfaces::srv::PatrolCommand>::SharedFuture patrol_future) {
+                    auto response = patrol_future.get();
+                    postStatusMessage(QString::fromStdString(response->message));
+                    releaseControlLease(lease_id);
+                });
+        });
+}
+
+void WaypointEditorPanel::onGoToWaypointButtonClick()
+{
+    if (waypoint_combo_->currentIndex() < 0) {
+        postStatusMessage(tr("Select a waypoint first"));
+        return;
+    }
+    sendPatrolCommand(
+        sahabat_interfaces::srv::PatrolCommand::Request::NAVIGATE,
+        waypoint_combo_->currentData().toString());
+}
+
+void WaypointEditorPanel::onStopNavigationButtonClick()
+{
+    sendPatrolCommand(sahabat_interfaces::srv::PatrolCommand::Request::STOP, QString());
+}
+
+void WaypointEditorPanel::onNewSetButtonClick()
+{
+    bool ok = false;
+    const QString name = QInputDialog::getText(
+        this,
+        tr("Save As Waypoint Set"),
+        tr("Waypoint set name:"),
+        QLineEdit::Normal,
+        tr("New Tour"),
+        &ok);
+    if (ok && !name.trimmed().isEmpty()) {
+        manageWaypointSet(sahabat_interfaces::srv::ManageWaypointSet::Request::CREATE, QString(), name.trimmed());
+    }
+}
+
+void WaypointEditorPanel::onRenameSetButtonClick()
+{
+    const int index = waypoint_set_combo_->currentIndex();
+    if (index < 0) {
+        return;
+    }
+    bool ok = false;
+    QString current = waypoint_set_combo_->currentText();
+    const QString name = QInputDialog::getText(
+        this,
+        tr("Rename Waypoint Set"),
+        tr("Waypoint set name:"),
+        QLineEdit::Normal,
+        current,
+        &ok);
+    if (ok && !name.trimmed().isEmpty()) {
+        manageWaypointSet(
+            sahabat_interfaces::srv::ManageWaypointSet::Request::RENAME,
+            waypoint_set_combo_->itemData(index).toString(),
+            name.trimmed());
+    }
+}
+
+void WaypointEditorPanel::onDeleteSetButtonClick()
+{
+    const int index = waypoint_set_combo_->currentIndex();
+    if (index < 0) {
+        return;
+    }
+    const auto answer = QMessageBox::question(
+        this,
+        tr("Delete Waypoint Set"),
+        tr("Archive waypoint set '%1'? This keeps the YAML under waypoint_sets/archive.").arg(waypoint_set_combo_->currentText()));
+    if (answer == QMessageBox::Yes) {
+        manageWaypointSet(
+            sahabat_interfaces::srv::ManageWaypointSet::Request::DELETE,
+            waypoint_set_combo_->itemData(index).toString(),
+            QString());
+    }
+}
+
+void WaypointEditorPanel::onMarkerSizeChanged(double value)
+{
+    if (!nh_) {
+        return;
+    }
+    auto results = nh_->set_parameters({rclcpp::Parameter("waypoint_marker_size", value)});
+    if (!results.empty() && !results.front().successful) {
+        postStatusMessage(QString::fromStdString(results.front().reason));
+    }
 }
 
 void WaypointEditorPanel::onAutoToggle(bool checked)
@@ -415,28 +816,64 @@ void WaypointEditorPanel::onLoad2DMapButtonClick()
     QString qpath = QFileDialog::getOpenFileName(
         this,
         tr("Open 2D Map YAML"),
-        "",
+        map_dialog_directory_,
         tr("YAML Files (*.yaml)"));
 
     if (qpath.isEmpty()) {
         return;
     }
 
-    if (!load_map_client_->wait_for_service(std::chrono::seconds(2))) {
+    if (!control_lease_client_ || !load_map_client_) {
+        postStatusMessage(tr("Operator services unavailable"));
         return;
     }
-    auto req = std::make_shared<nav2_msgs::srv::LoadMap::Request>();
-    req->map_url = qpath.toStdString();
-    load_map_client_->async_send_request(req,
-        [this](rclcpp::Client<nav2_msgs::srv::LoadMap>::SharedFuture future) {
-            bool ok = false;
+    if (!control_lease_client_->wait_for_service(std::chrono::milliseconds(500)) ||
+        !load_map_client_->wait_for_service(std::chrono::seconds(2))) {
+        postStatusMessage(tr("Operator map service unavailable"));
+        return;
+    }
+
+    const QFileInfo map_file(qpath);
+    const QString map_id = map_file.fileName() == QStringLiteral("map.yaml")
+        ? map_file.dir().dirName()
+        : map_file.completeBaseName();
+
+    auto lease_req = std::make_shared<sahabat_interfaces::srv::ControlLease::Request>();
+    lease_req->action = sahabat_interfaces::srv::ControlLease::Request::ACQUIRE;
+    lease_req->client_id = "rviz_waypoint_editor_panel";
+    control_lease_client_->async_send_request(lease_req,
+        [this, map_id](rclcpp::Client<sahabat_interfaces::srv::ControlLease>::SharedFuture lease_future) {
+            auto lease = lease_future.get();
+            if (!lease->success) {
+                postStatusMessage(QString::fromStdString(lease->message));
+                return;
+            }
+
+            auto req = std::make_shared<sahabat_interfaces::srv::LoadMap::Request>();
+            req->map_id = map_id.toStdString();
+            req->lease_id = lease->lease_id;
+            load_map_client_->async_send_request(req,
+                [this, map_id, lease_id = lease->lease_id](rclcpp::Client<sahabat_interfaces::srv::LoadMap>::SharedFuture future) {
+                    bool ok = false;
+                    QString message = tr("Failed to load 2D Map");
             try {
                 auto response = future.get();
-                ok = true;
+                ok = response->success;
+                if (!ok) {
+                    message = QString::fromStdString(response->message);
+                }
             } catch (const std::exception &e) {
                 ok = false;
+                message = QString("Failed to load 2D Map: %1").arg(e.what());
             }
-            postStatusMessage(ok ? tr("Loaded 2D Map") : tr("Failed to load 2D Map"));
+                    if (ok) {
+                        map_id_ = map_id;
+                        refreshWaypointSets();
+                        refreshWaypoints();
+                    }
+                    postStatusMessage(ok ? tr("Loaded 2D Map") : message);
+                    releaseControlLease(lease_id);
+                });
         });
 }
 
@@ -445,7 +882,7 @@ void WaypointEditorPanel::onLoad3DMapButtonClick()
     QString qpath = QFileDialog::getOpenFileName(
         this,
         tr("Open 3D Map PCD"),
-        "",
+        map_dialog_directory_,
         tr("PCD Files (*.pcd)"));
 
     if (qpath.isEmpty()) {
@@ -477,13 +914,18 @@ void WaypointEditorPanel::onLoadWaypointsButtonClick()
     load_client_->async_send_request(req,
         [this](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
             bool ok = false;
+            std::string message = "Failed to load WPs";
             try {
                 auto response = future.get();
                 ok = response->success;
+                message = response->message;
             } catch (...) {
                 ok = false;
             }
-            postStatusMessage(ok ? tr("Loaded WPs") : tr("Failed to load WPs"));
+            if (ok) {
+                refreshWaypointSets();
+            }
+            postStatusMessage(ok ? QString::fromStdString(message) : QString::fromStdString(message));
         });
 }
 
@@ -496,13 +938,15 @@ void WaypointEditorPanel::onSaveWaypointsButtonClick()
     save_client_->async_send_request(req,
         [this](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture future) {
             bool ok = false;
+            std::string message = "Failed to save WPs";
             try {
                 auto response = future.get();
                 ok = response->success;
+                message = response->message;
             } catch (...) {
                 ok = false;
             }
-            postStatusMessage(ok ? tr("Saved WPs") : tr("Failed to save WPs"));
+            postStatusMessage(ok ? QString::fromStdString(message) : QString::fromStdString(message));
         });
 }
 
