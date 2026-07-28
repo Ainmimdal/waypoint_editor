@@ -418,6 +418,7 @@ void WaypointEditorPanel::onInitialize()
 {
     nh_               = this->getDisplayContext()->getRosNodeAbstraction().lock()->get_raw_node();
     load_map_client_  = nh_->create_client<sahabat_interfaces::srv::LoadMap>("/operator/maps/load");
+    nav2_load_map_client_ = nh_->create_client<nav2_msgs::srv::LoadMap>("/map_server/load_map");
     load_client_      = nh_->create_client<std_srvs::srv::Trigger>("load_waypoints");
     save_client_      = nh_->create_client<std_srvs::srv::Trigger>("save_waypoints");
     undo_client_      = nh_->create_client<std_srvs::srv::Trigger>("undo_waypoints");
@@ -823,20 +824,49 @@ void WaypointEditorPanel::onLoad2DMapButtonClick()
         return;
     }
 
-    if (!control_lease_client_ || !load_map_client_) {
-        postStatusMessage(tr("Operator services unavailable"));
-        return;
-    }
-    if (!control_lease_client_->wait_for_service(std::chrono::milliseconds(500)) ||
-        !load_map_client_->wait_for_service(std::chrono::seconds(2))) {
-        postStatusMessage(tr("Operator map service unavailable"));
-        return;
-    }
-
     const QFileInfo map_file(qpath);
     const QString map_id = map_file.fileName() == QStringLiteral("map.yaml")
         ? map_file.dir().dirName()
         : map_file.completeBaseName();
+
+    const bool operator_available =
+        control_lease_client_ && load_map_client_ &&
+        control_lease_client_->wait_for_service(std::chrono::milliseconds(500)) &&
+        load_map_client_->wait_for_service(std::chrono::milliseconds(500));
+
+    if (!operator_available) {
+        if (!nav2_load_map_client_ ||
+            !nav2_load_map_client_->wait_for_service(std::chrono::seconds(2))) {
+            postStatusMessage(tr("Map load service unavailable"));
+            return;
+        }
+        auto req = std::make_shared<nav2_msgs::srv::LoadMap::Request>();
+        req->map_url = qpath.toStdString();
+        try {
+            nav2_load_map_client_->async_send_request(req,
+                [this, map_id](rclcpp::Client<nav2_msgs::srv::LoadMap>::SharedFuture future) {
+                    QString message = tr("Failed to load 2D Map");
+                    bool ok = false;
+                    try {
+                        auto response = future.get();
+                        ok = response && response->result == nav2_msgs::srv::LoadMap::Response::RESULT_SUCCESS;
+                    } catch (const std::exception &e) {
+                        message = QString("Failed to load 2D Map: %1").arg(e.what());
+                    } catch (...) {
+                        message = tr("Failed to load 2D Map");
+                    }
+                    if (ok) {
+                        map_id_ = map_id;
+                    }
+                    postStatusMessage(ok ? tr("Loaded 2D Map") : message);
+                });
+        } catch (const std::exception &e) {
+            postStatusMessage(QString("Failed to request 2D map load: %1").arg(e.what()));
+        } catch (...) {
+            postStatusMessage(tr("Failed to request 2D map load"));
+        }
+        return;
+    }
 
     auto lease_req = std::make_shared<sahabat_interfaces::srv::ControlLease::Request>();
     lease_req->action = sahabat_interfaces::srv::ControlLease::Request::ACQUIRE;

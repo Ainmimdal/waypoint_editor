@@ -100,6 +100,7 @@ private:
 
     rclcpp::Node::SharedPtr nh_;
     rclcpp::Client<sahabat_interfaces::srv::LoadMap>::SharedPtr load_map_client_;
+    rclcpp::Client<nav2_msgs::srv::LoadMap>::SharedPtr nav2_load_map_client_;
     rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr load_client_;
     rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr save_client_;
     rclcpp::Client<std_srvs::srv::Trigger>::SharedPtr undo_client_;
