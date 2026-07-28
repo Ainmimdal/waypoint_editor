@@ -428,7 +428,7 @@ void WaypointEditorPanel::onInitialize()
     auto_stop_client_ = nh_->create_client<std_srvs::srv::Trigger>("stop_auto_waypoints");
     list_sets_client_ = nh_->create_client<sahabat_interfaces::srv::ListWaypointSets>("waypoint_editor/list_sets");
     manage_set_client_= nh_->create_client<sahabat_interfaces::srv::ManageWaypointSet>("waypoint_editor/manage_set");
-    get_waypoints_client_ = nh_->create_client<sahabat_interfaces::srv::GetWaypoints>("/operator/waypoints/get");
+    get_waypoints_client_ = nh_->create_client<sahabat_interfaces::srv::GetWaypoints>("waypoint_editor/get_waypoints");
     control_lease_client_ = nh_->create_client<sahabat_interfaces::srv::ControlLease>("/operator/control_lease");
     patrol_client_ = nh_->create_client<sahabat_interfaces::srv::PatrolCommand>("/operator/patrol");
     auto_distance_pub_= nh_->create_publisher<std_msgs::msg::Float64>("auto_waypoint_min_distance", rclcpp::QoS(1).transient_local());
@@ -571,10 +571,18 @@ void WaypointEditorPanel::refreshWaypoints()
                 QMetaObject::invokeMethod(this, [this, response]() {
                     QSignalBlocker blocker(waypoint_combo_);
                     waypoint_combo_->clear();
+                    if (response->waypoints.empty()) {
+                        postStatusMessage(QString::fromStdString(
+                            response->message.empty()
+                                ? "No waypoints in current set"
+                                : response->message));
+                        return;
+                    }
                     for (const auto &waypoint : response->waypoints) {
                         const QString label = QString::fromStdString(waypoint.name.empty() ? waypoint.id : waypoint.name);
                         waypoint_combo_->addItem(label, QString::fromStdString(waypoint.id));
                     }
+                    postStatusMessage(QString::fromStdString(response->message));
                 }, Qt::QueuedConnection);
             } catch (...) {
                 postStatusMessage(tr("Failed to refresh waypoints"));
@@ -999,6 +1007,9 @@ void WaypointEditorPanel::onSaveWaypointsButtonClick()
                 message = response->message;
             } catch (...) {
                 ok = false;
+            }
+            if (ok) {
+                refreshWaypoints();
             }
             postStatusMessage(ok ? QString::fromStdString(message) : QString::fromStdString(message));
         });

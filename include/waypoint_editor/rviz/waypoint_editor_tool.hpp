@@ -53,6 +53,7 @@ public:
     void handleClearWaypoints(const std::shared_ptr<std_srvs::srv::Trigger::Request> req, std::shared_ptr<std_srvs::srv::Trigger::Response> res);
     void handleListWaypointSets(const std::shared_ptr<sahabat_interfaces::srv::ListWaypointSets::Request> req, std::shared_ptr<sahabat_interfaces::srv::ListWaypointSets::Response> res);
     void handleManageWaypointSet(const std::shared_ptr<sahabat_interfaces::srv::ManageWaypointSet::Request> req, std::shared_ptr<sahabat_interfaces::srv::ManageWaypointSet::Response> res);
+    void handleGetWaypoints(const std::shared_ptr<sahabat_interfaces::srv::GetWaypoints::Request> req, std::shared_ptr<sahabat_interfaces::srv::GetWaypoints::Response> res);
     void publishLineMarker();
     void publishTotalWpsDist();
     void publishLastWpsDist();
@@ -98,6 +99,7 @@ private:
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr auto_stop_service_;
     rclcpp::Service<sahabat_interfaces::srv::ListWaypointSets>::SharedPtr list_sets_service_;
     rclcpp::Service<sahabat_interfaces::srv::ManageWaypointSet>::SharedPtr manage_set_service_;
+    rclcpp::Service<sahabat_interfaces::srv::GetWaypoints>::SharedPtr get_waypoints_service_;
     rclcpp::Client<sahabat_interfaces::srv::ControlLease>::SharedPtr operator_lease_client_;
     rclcpp::Client<sahabat_interfaces::srv::GetWaypoints>::SharedPtr operator_get_waypoints_client_;
     rclcpp::Client<sahabat_interfaces::srv::SaveWaypoints>::SharedPtr operator_save_waypoints_client_;

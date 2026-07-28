@@ -211,6 +211,10 @@ void WaypointEditorTool::onInitialize()
         "waypoint_editor/manage_set",
         std::bind(&WaypointEditorTool::handleManageWaypointSet, this, _1, _2)
     );
+    get_waypoints_service_ = nh_->create_service<sahabat_interfaces::srv::GetWaypoints>(
+        "waypoint_editor/get_waypoints",
+        std::bind(&WaypointEditorTool::handleGetWaypoints, this, _1, _2)
+    );
     auto_start_service_ = nh_->create_service<std_srvs::srv::Trigger>(
         "start_auto_waypoints",
         [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/, std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
@@ -1556,6 +1560,41 @@ void WaypointEditorTool::handleManageWaypointSet(
 
     res->active_set_id = active_set_id_;
     res->success = true;
+}
+
+void WaypointEditorTool::handleGetWaypoints(
+    const std::shared_ptr<sahabat_interfaces::srv::GetWaypoints::Request> req,
+    std::shared_ptr<sahabat_interfaces::srv::GetWaypoints::Response> res)
+{
+    if (!req->set_id.empty() && req->set_id != active_set_id_) {
+        std::string error;
+        const bool loaded = usingOperatorBackend()
+            ? loadOperatorWaypointSet(req->set_id, error)
+            : loadWaypointSet(req->set_id, error);
+        if (!loaded) {
+            res->message = error;
+            return;
+        }
+    }
+
+    res->revision = static_cast<uint64_t>(std::max(0, active_revision_));
+    res->set_id = active_set_id_;
+    for (std::size_t i = 0; i < waypoint_sequence_.size(); ++i) {
+        const auto &wp = waypoint_sequence_.at(i);
+        sahabat_interfaces::msg::Waypoint item;
+        item.id = std::to_string(i);
+        item.name = wp.function_command.empty()
+            ? "waypoint_" + std::to_string(i + 1)
+            : wp.function_command;
+        item.pose.x = wp.pose.pose.position.x;
+        item.pose.y = wp.pose.pose.position.y;
+        item.pose.theta = YawFromPose(wp.pose.pose);
+        item.dwell_seconds = 0.0;
+        item.enabled = true;
+        res->waypoints.push_back(item);
+    }
+    res->message = std::to_string(res->waypoints.size())
+        + " waypoint(s) in current editor set";
 }
 
 bool WaypointEditorTool::loadWaypointsFromPath(const std::string &path, bool load_yaml, std::string &error)
