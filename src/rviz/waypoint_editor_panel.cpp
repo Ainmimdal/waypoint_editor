@@ -843,7 +843,20 @@ void WaypointEditorPanel::onLoad2DMapButtonClick()
     lease_req->client_id = "rviz_waypoint_editor_panel";
     control_lease_client_->async_send_request(lease_req,
         [this, map_id](rclcpp::Client<sahabat_interfaces::srv::ControlLease>::SharedFuture lease_future) {
-            auto lease = lease_future.get();
+            sahabat_interfaces::srv::ControlLease::Response::SharedPtr lease;
+            try {
+                lease = lease_future.get();
+            } catch (const std::exception &e) {
+                postStatusMessage(QString("Failed to acquire map-load control: %1").arg(e.what()));
+                return;
+            } catch (...) {
+                postStatusMessage(tr("Failed to acquire map-load control"));
+                return;
+            }
+            if (!lease) {
+                postStatusMessage(tr("Failed to acquire map-load control"));
+                return;
+            }
             if (!lease->success) {
                 postStatusMessage(QString::fromStdString(lease->message));
                 return;
@@ -852,28 +865,39 @@ void WaypointEditorPanel::onLoad2DMapButtonClick()
             auto req = std::make_shared<sahabat_interfaces::srv::LoadMap::Request>();
             req->map_id = map_id.toStdString();
             req->lease_id = lease->lease_id;
-            load_map_client_->async_send_request(req,
-                [this, map_id, lease_id = lease->lease_id](rclcpp::Client<sahabat_interfaces::srv::LoadMap>::SharedFuture future) {
-                    bool ok = false;
-                    QString message = tr("Failed to load 2D Map");
             try {
-                auto response = future.get();
-                ok = response->success;
-                if (!ok) {
-                    message = QString::fromStdString(response->message);
-                }
+                load_map_client_->async_send_request(req,
+                    [this, map_id, lease_id = lease->lease_id](rclcpp::Client<sahabat_interfaces::srv::LoadMap>::SharedFuture future) {
+                        bool ok = false;
+                        QString message = tr("Failed to load 2D Map");
+                        try {
+                            auto response = future.get();
+                            if (response) {
+                                ok = response->success;
+                                message = QString::fromStdString(response->message);
+                            } else {
+                                message = tr("Failed to load 2D Map: empty service response");
+                            }
+                        } catch (const std::exception &e) {
+                            message = QString("Failed to load 2D Map: %1").arg(e.what());
+                        } catch (...) {
+                            message = tr("Failed to load 2D Map");
+                        }
+                        if (ok) {
+                            map_id_ = map_id;
+                            refreshWaypointSets();
+                            refreshWaypoints();
+                        }
+                        postStatusMessage(ok ? tr("Loaded 2D Map") : message);
+                        releaseControlLease(lease_id);
+                    });
             } catch (const std::exception &e) {
-                ok = false;
-                message = QString("Failed to load 2D Map: %1").arg(e.what());
+                postStatusMessage(QString("Failed to request 2D map load: %1").arg(e.what()));
+                releaseControlLease(lease->lease_id);
+            } catch (...) {
+                postStatusMessage(tr("Failed to request 2D map load"));
+                releaseControlLease(lease->lease_id);
             }
-                    if (ok) {
-                        map_id_ = map_id;
-                        refreshWaypointSets();
-                        refreshWaypoints();
-                    }
-                    postStatusMessage(ok ? tr("Loaded 2D Map") : message);
-                    releaseControlLease(lease_id);
-                });
         });
 }
 
