@@ -1,6 +1,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rviz_common/display_context.hpp>
 #include <rviz_common/load_resource.hpp>
+#include <rviz_common/tool.hpp>
+#include <rviz_common/tool_manager.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <nav2_msgs/srv/load_map.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -26,13 +28,17 @@
 #include <QInputDialog>
 #include <QMessageBox>
 #include <QVariant>
+#include <QColor>
 #include <QDir>
 #include <QFileInfo>
 #include <QScrollArea>
 #include <QFrame>
 #include <QWidget>
+#include <QAbstractItemView>
 
 #include <chrono>
+#include <map>
+#include <set>
 
 #include "waypoint_editor/rviz/waypoint_editor_panel.hpp"
 
@@ -110,8 +116,6 @@ WaypointEditorPanel::WaypointEditorPanel(QWidget *parent) : rviz_common::Panel(p
     status_container->setContentsMargins(6, 6, 6, 6);
     status_container->setSpacing(6);
     status_container->addLayout(status_row);
-    status_container->addLayout(last_wp_dist_row);
-    status_container->addLayout(total_wp_dist_row);
 
     // Setup logo
     QLabel *logo_label = new QLabel(this);
@@ -142,6 +146,7 @@ WaypointEditorPanel::WaypointEditorPanel(QWidget *parent) : rviz_common::Panel(p
     // Nudge logo down to align visually with group box height (account for title bar)
     logo_layout->setContentsMargins(0, status_group->fontMetrics().height(), 0, 0);
     top_layout->addWidget(status_group);
+    logo_label->hide();
     top_layout->addLayout(logo_layout);
     top_layout->setAlignment(status_group, Qt::AlignVCenter);
     top_layout->setAlignment(logo_layout,  Qt::AlignVCenter);
@@ -149,8 +154,8 @@ WaypointEditorPanel::WaypointEditorPanel(QWidget *parent) : rviz_common::Panel(p
     // Buttons
     load_2d_map_button_    = new QPushButton("Load 2D Map", this);
     load_3d_map_button_    = new QPushButton("Load 3D Map", this);
-    load_waypoints_button_ = new QPushButton("Load WPs", this);
-    save_waypoints_button_ = new QPushButton("Save WPs", this);
+    load_waypoints_button_ = new QPushButton("Load WPs + Routes", this);
+    save_waypoints_button_ = new QPushButton("Save WPs + Routes", this);
     waypoint_set_combo_    = new QComboBox(this);
     refresh_sets_button_   = new QPushButton("Refresh", this);
     new_set_button_        = new QPushButton("Save As Set", this);
@@ -164,6 +169,24 @@ WaypointEditorPanel::WaypointEditorPanel(QWidget *parent) : rviz_common::Panel(p
     undo_button_           = new QPushButton("Undo", this);
     redo_button_           = new QPushButton("Redo", this);
     clear_button_          = new QPushButton("Clear All", this);
+    route_from_combo_      = new QComboBox(this);
+    route_to_combo_        = new QComboBox(this);
+    route_combo_           = new QComboBox(this);
+    route_points_list_     = new QListWidget(this);
+    available_route_points_list_ = new QListWidget(this);
+    selected_route_label_  = new QLabel("SELECTED ROUTE\nNone", this);
+    create_route_button_   = new QPushButton("Create Route", this);
+    delete_route_button_   = new QPushButton("Delete Route", this);
+    add_route_point_button_= new QPushButton("Add Route Point", this);
+    attach_route_point_button_ = new QPushButton("Use Existing Point", this);
+    detach_route_point_button_ = new QPushButton("Remove", this);
+    detach_route_point_button_->setToolTip("Detach the selected point from this route only");
+    move_route_point_earlier_button_ = new QPushButton("Move Up", this);
+    move_route_point_later_button_ = new QPushButton("Move Down", this);
+    delete_route_points_everywhere_button_ = new QPushButton("Delete from Map", this);
+    delete_route_points_everywhere_button_->setToolTip(
+        "Permanently delete selected points from every route");
+    route_bidirectional_check_ = new QCheckBox("Bidirectional", this);
 
     // Button sizing/styling to break monotony
     for (auto *btn : {load_2d_map_button_, load_3d_map_button_, load_waypoints_button_, save_waypoints_button_}) {
@@ -195,6 +218,26 @@ WaypointEditorPanel::WaypointEditorPanel(QWidget *parent) : rviz_common::Panel(p
         btn->setMinimumWidth(64);
     }
     go_waypoint_button_->setStyleSheet("font-weight: bold;");
+    route_from_combo_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    route_to_combo_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    route_combo_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    route_points_list_->setSelectionMode(QAbstractItemView::SingleSelection);
+    route_points_list_->setFixedHeight(76);
+    route_points_list_->setAlternatingRowColors(true);
+    available_route_points_list_->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    available_route_points_list_->setFixedHeight(76);
+    available_route_points_list_->setAlternatingRowColors(true);
+    selected_route_label_->setWordWrap(true);
+    QFont selectedRouteFont = smallFont;
+    selectedRouteFont.setPointSize(12);
+    selectedRouteFont.setBold(true);
+    selected_route_label_->setFont(selectedRouteFont);
+    selected_route_label_->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+    selected_route_label_->setMinimumHeight(54);
+    selected_route_label_->setStyleSheet(
+        "QLabel { background: #073846; color: #f2fcff; "
+        "border: 2px solid #19c9ef; border-radius: 5px; padding: 5px 8px; }");
+    add_route_point_button_->setStyleSheet("font-weight: bold;");
 
     // Map section
     QHBoxLayout *map_row = new QHBoxLayout;
@@ -294,6 +337,132 @@ WaypointEditorPanel::WaypointEditorPanel(QWidget *parent) : rviz_common::Panel(p
     action_group->setLayout(wp_layout);
     action_group->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Minimum);
 
+    QHBoxLayout *route_select_row = new QHBoxLayout;
+    route_select_row->setContentsMargins(6, 6, 6, 0);
+    route_select_row->setSpacing(6);
+    route_select_row->addWidget(new QLabel("1. Select route", this));
+
+    QHBoxLayout *route_select_combo_row = new QHBoxLayout;
+    route_select_combo_row->setContentsMargins(6, 0, 6, 0);
+    route_select_combo_row->addWidget(route_combo_, 1);
+
+    QHBoxLayout *route_from_row = new QHBoxLayout;
+    route_from_row->setContentsMargins(6, 4, 6, 0);
+    route_from_row->setSpacing(6);
+    route_from_row->addWidget(new QLabel("From", this));
+    route_from_row->addWidget(route_from_combo_, 1);
+
+    QHBoxLayout *route_to_row = new QHBoxLayout;
+    route_to_row->setContentsMargins(6, 0, 6, 0);
+    route_to_row->setSpacing(6);
+    route_to_row->addWidget(new QLabel("To", this));
+    route_to_row->addWidget(route_to_combo_, 1);
+
+    QHBoxLayout *route_create_row = new QHBoxLayout;
+    route_create_row->setContentsMargins(6, 0, 6, 0);
+    route_create_row->setSpacing(6);
+    route_create_row->addWidget(route_bidirectional_check_);
+    route_create_row->addStretch();
+    route_bidirectional_check_->setChecked(true);
+
+    QHBoxLayout *route_create_button_row = new QHBoxLayout;
+    route_create_button_row->setContentsMargins(6, 0, 6, 0);
+    route_create_button_row->addWidget(create_route_button_, 1);
+
+    QLabel *route_points_label = new QLabel("2. Points in selected route (travel order)", this);
+    route_points_label->setStyleSheet("font-weight: bold;");
+    route_points_label->setContentsMargins(6, 6, 6, 0);
+
+    QHBoxLayout *route_points_row = new QHBoxLayout;
+    route_points_row->setContentsMargins(6, 0, 6, 0);
+    route_points_row->addWidget(route_points_list_, 1);
+
+    QHBoxLayout *route_point_actions_row = new QHBoxLayout;
+    route_point_actions_row->setContentsMargins(6, 0, 6, 0);
+    route_point_actions_row->setSpacing(6);
+    route_point_actions_row->addWidget(move_route_point_earlier_button_, 1);
+    route_point_actions_row->addWidget(move_route_point_later_button_, 1);
+    route_point_actions_row->addWidget(detach_route_point_button_, 1);
+
+    QLabel *available_points_label = new QLabel("3. All route points on this map", this);
+    available_points_label->setStyleSheet("font-weight: bold;");
+    available_points_label->setContentsMargins(6, 6, 6, 0);
+
+    QHBoxLayout *available_points_row = new QHBoxLayout;
+    available_points_row->setContentsMargins(6, 0, 6, 0);
+    available_points_row->addWidget(available_route_points_list_, 1);
+
+    QHBoxLayout *available_point_actions_row = new QHBoxLayout;
+    available_point_actions_row->setContentsMargins(6, 0, 6, 0);
+    available_point_actions_row->setSpacing(6);
+    attach_route_point_button_->setText("Add to Route");
+    attach_route_point_button_->setToolTip(
+        "Add all selected map points to the end of this route");
+    available_point_actions_row->addWidget(attach_route_point_button_, 1);
+    available_point_actions_row->addWidget(delete_route_points_everywhere_button_, 1);
+
+    QHBoxLayout *route_actions_row = new QHBoxLayout;
+    route_actions_row->setContentsMargins(6, 0, 6, 0);
+    route_actions_row->setSpacing(6);
+    add_route_point_button_->setText("Add New Point to Selected Route");
+    route_actions_row->addWidget(add_route_point_button_, 1);
+
+    QHBoxLayout *route_delete_row = new QHBoxLayout;
+    route_delete_row->setContentsMargins(6, 0, 6, 6);
+    route_delete_row->addWidget(delete_route_button_, 1);
+
+    QLabel *route_help = new QLabel(
+        "Select a route above. Only that route stays bright on the map. "
+        "Add New Point switches to the map tool; click the map to place it. "
+        "The lower list can add existing points to this route or permanently "
+        "delete them from every route.", this);
+    route_help->setWordWrap(true);
+    route_help->setStyleSheet("color: #666;");
+    route_help->setContentsMargins(6, 4, 6, 6);
+
+    QVBoxLayout *route_layout = new QVBoxLayout;
+    route_layout->setContentsMargins(0, 0, 0, 0);
+    route_layout->setSpacing(4);
+    route_layout->addLayout(route_select_row);
+    route_layout->addLayout(route_select_combo_row);
+    route_layout->addWidget(route_points_label);
+    route_layout->addLayout(route_points_row);
+    route_layout->addLayout(route_point_actions_row);
+    route_layout->addLayout(route_actions_row);
+    route_layout->addWidget(available_points_label);
+    route_layout->addLayout(available_points_row);
+    route_layout->addLayout(available_point_actions_row);
+    route_layout->addLayout(route_delete_row);
+    route_layout->addWidget(route_help);
+
+    QGroupBox *route_group = new QGroupBox(tr("Preferred Routes"), this);
+    route_group->setFont(smallFont);
+    route_group->setStyleSheet("QGroupBox::title { font-weight: bold; }");
+    route_group->setLayout(route_layout);
+    route_group->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Minimum);
+
+    QLabel *new_route_help = new QLabel(
+        "Create the connection first, then return to Routes to add its ordered points.",
+        this);
+    new_route_help->setWordWrap(true);
+    new_route_help->setStyleSheet("color: #666;");
+    new_route_help->setContentsMargins(6, 4, 6, 6);
+
+    QVBoxLayout *new_route_layout = new QVBoxLayout;
+    new_route_layout->setContentsMargins(0, 0, 0, 0);
+    new_route_layout->setSpacing(4);
+    new_route_layout->addLayout(route_from_row);
+    new_route_layout->addLayout(route_to_row);
+    new_route_layout->addLayout(route_create_row);
+    new_route_layout->addLayout(route_create_button_row);
+    new_route_layout->addWidget(new_route_help);
+
+    QGroupBox *new_route_group = new QGroupBox(tr("Create Preferred Route"), this);
+    new_route_group->setFont(smallFont);
+    new_route_group->setStyleSheet("QGroupBox::title { font-weight: bold; }");
+    new_route_group->setLayout(new_route_layout);
+    new_route_group->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Minimum);
+
     QLabel *auto_label = new QLabel("Auto Δd :", this);
     auto_label->setFont(boldFont);
     auto_label->setContentsMargins(0, 0, 0, 0);
@@ -348,6 +517,8 @@ WaypointEditorPanel::WaypointEditorPanel(QWidget *parent) : rviz_common::Panel(p
     auto_layout->setSpacing(6);
     auto_layout->addLayout(auto_row1);
     auto_layout->addLayout(auto_row2);
+    auto_layout->addLayout(last_wp_dist_row);
+    auto_layout->addLayout(total_wp_dist_row);
 
     QGroupBox *auto_group = new QGroupBox(tr("Auto Capture"), this);
     auto_group->setFont(smallFont);
@@ -364,15 +535,46 @@ WaypointEditorPanel::WaypointEditorPanel(QWidget *parent) : rviz_common::Panel(p
 
     layout_->addLayout(top_layout);
     layout_->addSpacing(8);
-    layout_->addWidget(map_group);
-    layout_->addSpacing(6);
-    layout_->addWidget(set_group);
-    layout_->addSpacing(6);
-    layout_->addWidget(goto_group);
-    layout_->addSpacing(6);
-    layout_->addWidget(action_group);
-    layout_->addSpacing(6);
-    layout_->addWidget(auto_group);
+    QTabWidget *tabs = new QTabWidget(this);
+
+    QWidget *waypoints_page = new QWidget(tabs);
+    QVBoxLayout *waypoints_layout = new QVBoxLayout(waypoints_page);
+    waypoints_layout->setContentsMargins(4, 6, 4, 4);
+    waypoints_layout->addWidget(map_group);
+    waypoints_layout->addWidget(set_group);
+    waypoints_layout->addWidget(action_group);
+    waypoints_layout->addStretch();
+    tabs->addTab(waypoints_page, tr("Waypoints"));
+
+    QWidget *routes_page = new QWidget(tabs);
+    QVBoxLayout *routes_layout = new QVBoxLayout(routes_page);
+    routes_layout->setContentsMargins(4, 6, 4, 4);
+    routes_layout->addWidget(route_group);
+    routes_layout->addStretch();
+    tabs->addTab(routes_page, tr("Routes"));
+
+    QWidget *new_route_page = new QWidget(tabs);
+    QVBoxLayout *new_route_page_layout = new QVBoxLayout(new_route_page);
+    new_route_page_layout->setContentsMargins(4, 6, 4, 4);
+    new_route_page_layout->addWidget(new_route_group);
+    new_route_page_layout->addStretch();
+    tabs->addTab(new_route_page, tr("New Route"));
+
+    QWidget *navigation_page = new QWidget(tabs);
+    QVBoxLayout *navigation_layout = new QVBoxLayout(navigation_page);
+    navigation_layout->setContentsMargins(4, 6, 4, 4);
+    navigation_layout->addWidget(goto_group);
+    navigation_layout->addStretch();
+    tabs->addTab(navigation_page, tr("Navigate"));
+
+    QWidget *auto_page = new QWidget(tabs);
+    QVBoxLayout *auto_page_layout = new QVBoxLayout(auto_page);
+    auto_page_layout->setContentsMargins(4, 6, 4, 4);
+    auto_page_layout->addWidget(auto_group);
+    auto_page_layout->addStretch();
+    tabs->addTab(auto_page, tr("Auto"));
+
+    layout_->addWidget(tabs, 1);
     layout_->addStretch();
 
     QWidget *content_widget = new QWidget(this);
@@ -386,10 +588,12 @@ WaypointEditorPanel::WaypointEditorPanel(QWidget *parent) : rviz_common::Panel(p
 
     QVBoxLayout *root_layout = new QVBoxLayout;
     root_layout->setContentsMargins(0, 0, 0, 0);
+    root_layout->setSpacing(4);
+    root_layout->addWidget(selected_route_label_);
     root_layout->addWidget(scroll_area);
     setLayout(root_layout);
     setMinimumWidth(320);
-    setMaximumWidth(430);
+    setMaximumWidth(560);
     setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
 
     // Connect signals
@@ -409,6 +613,16 @@ WaypointEditorPanel::WaypointEditorPanel(QWidget *parent) : rviz_common::Panel(p
     connect(undo_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onUndoWaypointsButtonClick);
     connect(redo_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onRedoWaypointsButtonClick);
     connect(clear_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onClearWaypointsButtonClick);
+    connect(create_route_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onCreateRouteButtonClick);
+    connect(delete_route_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onDeleteRouteButtonClick);
+    connect(add_route_point_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onAddRoutePointButtonClick);
+    connect(attach_route_point_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onAttachRoutePointButtonClick);
+    connect(detach_route_point_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onDetachRoutePointButtonClick);
+    connect(move_route_point_earlier_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onMoveRoutePointEarlierButtonClick);
+    connect(move_route_point_later_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onMoveRoutePointLaterButtonClick);
+    connect(delete_route_points_everywhere_button_, &QPushButton::clicked, this, &WaypointEditorPanel::onDeleteRoutePointsEverywhereButtonClick);
+    connect(route_combo_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &WaypointEditorPanel::onRouteSelected);
+    connect(route_bidirectional_check_, &QCheckBox::toggled, this, &WaypointEditorPanel::onRouteBidirectionalChanged);
     connect(auto_toggle_button_, &QPushButton::toggled, this, &WaypointEditorPanel::onAutoToggle);
 }
 
@@ -429,6 +643,8 @@ void WaypointEditorPanel::onInitialize()
     list_sets_client_ = nh_->create_client<sahabat_interfaces::srv::ListWaypointSets>("waypoint_editor/list_sets");
     manage_set_client_= nh_->create_client<sahabat_interfaces::srv::ManageWaypointSet>("waypoint_editor/manage_set");
     get_waypoints_client_ = nh_->create_client<sahabat_interfaces::srv::GetWaypoints>("waypoint_editor/get_waypoints");
+    get_graph_client_ = nh_->create_client<sahabat_interfaces::srv::GetWaypointGraph>("waypoint_editor/get_graph");
+    edit_route_client_ = nh_->create_client<sahabat_interfaces::srv::EditRoute>("waypoint_editor/edit_route");
     control_lease_client_ = nh_->create_client<sahabat_interfaces::srv::ControlLease>("/operator/control_lease");
     patrol_client_ = nh_->create_client<sahabat_interfaces::srv::PatrolCommand>("/operator/patrol");
     auto_distance_pub_= nh_->create_publisher<std_msgs::msg::Float64>("auto_waypoint_min_distance", rclcpp::QoS(1).transient_local());
@@ -446,6 +662,36 @@ void WaypointEditorPanel::onInitialize()
             QMetaObject::invokeMethod(total_wp_dist_value_label_, "setText", Qt::QueuedConnection, Q_ARG(QString, QString::number(msg->data, 'f', 3) + " m"));
         }
     );
+
+    graph_changed_sub_ = nh_->create_subscription<std_msgs::msg::Empty>(
+        "waypoint_editor/graph_changed", 10,
+        [this](std_msgs::msg::Empty::SharedPtr) {
+            QMetaObject::invokeMethod(
+                this,
+                [this]() { refreshWaypoints(); },
+                Qt::QueuedConnection);
+        }
+    );
+    route_point_selected_sub_ = nh_->create_subscription<std_msgs::msg::String>(
+        "waypoint_editor/route_point_selected", rclcpp::QoS(10).reliable(),
+        [this](std_msgs::msg::String::SharedPtr msg) {
+            const QString point_id = QString::fromStdString(msg->data);
+            QMetaObject::invokeMethod(
+                this,
+                [this, point_id]() {
+                    for (int row = 0; row < route_points_list_->count(); ++row) {
+                        auto *item = route_points_list_->item(row);
+                        if (item->data(Qt::UserRole).toString() == point_id) {
+                            route_points_list_->setCurrentItem(item);
+                            route_points_list_->scrollToItem(
+                                item, QAbstractItemView::PositionAtCenter);
+                            postStatusMessage(tr("Selected route point %1").arg(item->text()));
+                            break;
+                        }
+                    }
+                },
+                Qt::QueuedConnection);
+        });
     
     cloud_pub_ = nh_->create_publisher<sensor_msgs::msg::PointCloud2>("map_cloud", rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable());
     std::string maps_directory = "~/sahabat_ws/maps";
@@ -555,22 +801,43 @@ void WaypointEditorPanel::onRefreshSetsButtonClick()
 
 void WaypointEditorPanel::refreshWaypoints()
 {
-    if (!get_waypoints_client_ || !get_waypoints_client_->wait_for_service(std::chrono::milliseconds(300))) {
-        QSignalBlocker blocker(waypoint_combo_);
+    if (!get_graph_client_ || !get_graph_client_->wait_for_service(std::chrono::milliseconds(300))) {
+        QSignalBlocker waypoint_blocker(waypoint_combo_);
+        QSignalBlocker route_blocker(route_combo_);
+        QSignalBlocker route_points_blocker(route_points_list_);
+        QSignalBlocker available_points_blocker(available_route_points_list_);
         waypoint_combo_->clear();
+        route_combo_->clear();
+        route_points_list_->clear();
+        available_route_points_list_->clear();
         return;
     }
 
-    auto req = std::make_shared<sahabat_interfaces::srv::GetWaypoints::Request>();
+    auto req = std::make_shared<sahabat_interfaces::srv::GetWaypointGraph::Request>();
     req->map_id = map_id_.toStdString();
     req->set_id = waypoint_set_combo_->currentData().toString().toStdString();
-    get_waypoints_client_->async_send_request(req,
-        [this](rclcpp::Client<sahabat_interfaces::srv::GetWaypoints>::SharedFuture future) {
+    get_graph_client_->async_send_request(req,
+        [this](rclcpp::Client<sahabat_interfaces::srv::GetWaypointGraph>::SharedFuture future) {
             try {
                 auto response = future.get();
                 QMetaObject::invokeMethod(this, [this, response]() {
-                    QSignalBlocker blocker(waypoint_combo_);
+                    const QString previous_route = route_combo_->currentData().toString();
+                    const QString previous_route_point = route_points_list_->currentItem()
+                        ? route_points_list_->currentItem()->data(Qt::UserRole).toString()
+                        : QString();
+                    QSignalBlocker waypoint_blocker(waypoint_combo_);
+                    QSignalBlocker from_blocker(route_from_combo_);
+                    QSignalBlocker to_blocker(route_to_combo_);
+                    QSignalBlocker route_blocker(route_combo_);
+                    QSignalBlocker route_points_blocker(route_points_list_);
+                    QSignalBlocker available_points_blocker(available_route_points_list_);
+                    QSignalBlocker bidirectional_blocker(route_bidirectional_check_);
                     waypoint_combo_->clear();
+                    route_from_combo_->clear();
+                    route_to_combo_->clear();
+                    route_combo_->clear();
+                    route_points_list_->clear();
+                    available_route_points_list_->clear();
                     if (response->waypoints.empty()) {
                         postStatusMessage(QString::fromStdString(
                             response->message.empty()
@@ -580,7 +847,114 @@ void WaypointEditorPanel::refreshWaypoints()
                     }
                     for (const auto &waypoint : response->waypoints) {
                         const QString label = QString::fromStdString(waypoint.name.empty() ? waypoint.id : waypoint.name);
-                        waypoint_combo_->addItem(label, QString::fromStdString(waypoint.id));
+                        const QString id = QString::fromStdString(waypoint.id);
+                        waypoint_combo_->addItem(label, id);
+                        route_from_combo_->addItem(label, id);
+                        route_to_combo_->addItem(label, id);
+                    }
+                    if (route_to_combo_->count() > 1) {
+                        route_to_combo_->setCurrentIndex(1);
+                    }
+                    int selected_route = -1;
+                    const QString selected_route_id = response->active_segment_id.empty()
+                        ? previous_route
+                        : QString::fromStdString(response->active_segment_id);
+                    std::map<std::string, std::pair<std::string, int>> shared_points;
+                    for (int i = 0; i < static_cast<int>(response->segments.size()); ++i) {
+                        const auto &segment = response->segments.at(static_cast<std::size_t>(i));
+                        const QString id = QString::fromStdString(segment.id);
+                        const QString direction = segment.bidirectional ? " ↔ " : " → ";
+                        const QString label = QString::fromStdString(
+                            segment.name.empty() ? segment.id : segment.name) +
+                            direction + QString::number(segment.via_points.size()) + " point(s)";
+                        route_combo_->addItem(label, id);
+                        route_combo_->setItemData(i, segment.bidirectional, Qt::UserRole + 1);
+                        route_combo_->setItemData(
+                            i,
+                            QString::fromStdString(segment.name.empty() ? segment.id : segment.name),
+                            Qt::UserRole + 2);
+                        route_combo_->setItemData(
+                            i,
+                            static_cast<int>(segment.via_points.size()),
+                            Qt::UserRole + 3);
+                        for (const auto &point : segment.via_points) {
+                            auto &entry = shared_points[point.id];
+                            entry.first = point.name.empty() ? point.id : point.name;
+                            entry.second += 1;
+                        }
+                        if (id == selected_route_id) {
+                            selected_route = i;
+                        }
+                    }
+                    if (selected_route >= 0) {
+                        route_combo_->setCurrentIndex(selected_route);
+                    }
+                    if (route_combo_->currentIndex() >= 0) {
+                        route_bidirectional_check_->setChecked(
+                            route_combo_->currentData(Qt::UserRole + 1).toBool());
+                        updateSelectedRouteLabel(route_combo_->currentIndex());
+                    } else {
+                        updateSelectedRouteLabel(-1);
+                    }
+
+                    std::set<std::string> points_in_selected_route;
+                    const std::string active_route_id =
+                        route_combo_->currentData().toString().toStdString();
+                    const auto active_route = std::find_if(
+                        response->segments.begin(), response->segments.end(),
+                        [&active_route_id](const sahabat_interfaces::msg::RouteSegment &segment) {
+                            return segment.id == active_route_id;
+                        });
+                    if (active_route != response->segments.end()) {
+                        for (std::size_t index = 0; index < active_route->via_points.size(); ++index) {
+                            const auto &point = active_route->via_points[index];
+                            points_in_selected_route.insert(point.id);
+                            const auto details = shared_points.find(point.id);
+                            const int usage_count = details == shared_points.end()
+                                ? 1
+                                : details->second.second;
+                            const QString shared_suffix = usage_count > 1
+                                ? tr("  [shared by %1 routes]").arg(usage_count)
+                                : QString();
+                            const QString point_id = QString::fromStdString(point.id);
+                            const QString point_name = QString::fromStdString(point.name);
+                            const QString point_label =
+                                point_name.isEmpty() || point_name == point_id
+                                ? point_id
+                                : point_id + " · " + point_name;
+                            auto *item = new QListWidgetItem(
+                                tr("%1. %2%3")
+                                    .arg(index + 1)
+                                    .arg(point_label)
+                                    .arg(shared_suffix),
+                                route_points_list_);
+                            item->setData(Qt::UserRole, point_id);
+                            if (point_id == previous_route_point) {
+                                route_points_list_->setCurrentItem(item);
+                            }
+                        }
+                    }
+                    for (const auto &[id, details] : shared_points) {
+                        const bool in_selected_route = points_in_selected_route.count(id) > 0;
+                        const QString usage = details.second == 1
+                            ? tr("1 route")
+                            : tr("%1 routes").arg(details.second);
+                        const QString membership = in_selected_route
+                            ? tr("  [in selected]")
+                            : QString();
+                        const QString point_id = QString::fromStdString(id);
+                        const QString point_name = QString::fromStdString(details.first);
+                        const QString point_label =
+                            point_name.isEmpty() || point_name == point_id
+                            ? point_id
+                            : point_id + " · " + point_name;
+                        auto *item = new QListWidgetItem(
+                            point_label + "  -  " + usage + membership,
+                            available_route_points_list_);
+                        item->setData(Qt::UserRole, point_id);
+                        if (in_selected_route) {
+                            item->setForeground(QColor(110, 110, 110));
+                        }
                     }
                     postStatusMessage(QString::fromStdString(response->message));
                 }, Qt::QueuedConnection);
@@ -593,6 +967,255 @@ void WaypointEditorPanel::refreshWaypoints()
 void WaypointEditorPanel::onRefreshWaypointsButtonClick()
 {
     refreshWaypoints();
+}
+
+void WaypointEditorPanel::updateSelectedRouteLabel(int index)
+{
+    if (index < 0 || index >= route_combo_->count()) {
+        selected_route_label_->setText(tr("SELECTED ROUTE\nNone"));
+        return;
+    }
+    const QString name = route_combo_->itemData(index, Qt::UserRole + 2).toString();
+    const int point_count = route_combo_->itemData(index, Qt::UserRole + 3).toInt();
+    const QString direction = route_combo_->itemData(index, Qt::UserRole + 1).toBool()
+        ? tr("two-way")
+        : tr("one-way");
+    selected_route_label_->setText(
+        tr("SELECTED ROUTE\n%1 · %2 pts · %3")
+            .arg(name)
+            .arg(point_count)
+            .arg(direction));
+}
+
+void WaypointEditorPanel::sendRouteEdit(
+    uint8_t action,
+    const QString &segment_id,
+    const QString &from_waypoint_id,
+    const QString &to_waypoint_id,
+    bool bidirectional,
+    const QString &route_point_id,
+    const QStringList &route_point_ids)
+{
+    if (!edit_route_client_ ||
+        !edit_route_client_->wait_for_service(std::chrono::milliseconds(500)))
+    {
+        postStatusMessage(tr("Route editor service unavailable"));
+        return;
+    }
+    auto req = std::make_shared<sahabat_interfaces::srv::EditRoute::Request>();
+    req->action = action;
+    req->segment_id = segment_id.toStdString();
+    req->from_waypoint_id = from_waypoint_id.toStdString();
+    req->to_waypoint_id = to_waypoint_id.toStdString();
+    req->bidirectional = bidirectional;
+    req->route_point_id = route_point_id.toStdString();
+    for (const auto &point_id : route_point_ids) {
+        req->route_point_ids.push_back(point_id.toStdString());
+    }
+    edit_route_client_->async_send_request(
+        req,
+        [this, action](rclcpp::Client<sahabat_interfaces::srv::EditRoute>::SharedFuture future) {
+            try {
+                const auto response = future.get();
+                postStatusMessage(QString::fromStdString(response->message));
+                if (response->success &&
+                    action != sahabat_interfaces::srv::EditRoute::Request::ARM_ADD_POINT &&
+                    action != sahabat_interfaces::srv::EditRoute::Request::CANCEL_ADD_POINT)
+                {
+                    refreshWaypoints();
+                }
+            } catch (...) {
+                postStatusMessage(tr("Route edit failed"));
+            }
+        });
+}
+
+void WaypointEditorPanel::onCreateRouteButtonClick()
+{
+    if (route_from_combo_->currentIndex() < 0 ||
+        route_to_combo_->currentIndex() < 0)
+    {
+        postStatusMessage(tr("Select route endpoints first"));
+        return;
+    }
+    sendRouteEdit(
+        sahabat_interfaces::srv::EditRoute::Request::CREATE,
+        QString(),
+        route_from_combo_->currentData().toString(),
+        route_to_combo_->currentData().toString(),
+        route_bidirectional_check_->isChecked());
+}
+
+void WaypointEditorPanel::onDeleteRouteButtonClick()
+{
+    if (route_combo_->currentIndex() < 0) {
+        postStatusMessage(tr("Select a route first"));
+        return;
+    }
+    const auto answer = QMessageBox::question(
+        this,
+        tr("Delete Preferred Route"),
+        tr("Delete route '%1' and all of its route points?")
+            .arg(route_combo_->currentText()));
+    if (answer == QMessageBox::Yes) {
+        sendRouteEdit(
+            sahabat_interfaces::srv::EditRoute::Request::DELETE,
+            route_combo_->currentData().toString());
+    }
+}
+
+void WaypointEditorPanel::onAddRoutePointButtonClick()
+{
+    if (route_combo_->currentIndex() < 0) {
+        postStatusMessage(tr("Create or select a route first"));
+        return;
+    }
+    sendRouteEdit(
+        sahabat_interfaces::srv::EditRoute::Request::ARM_ADD_POINT,
+        route_combo_->currentData().toString());
+
+    auto *tool_manager = getDisplayContext()->getToolManager();
+    for (int index = 0; index < tool_manager->numTools(); ++index) {
+        auto *tool = tool_manager->getTool(index);
+        if (tool && tool->getClassId() == "waypoint_editor/WaypointEditorTool") {
+            tool_manager->setCurrentTool(tool);
+            break;
+        }
+    }
+}
+
+void WaypointEditorPanel::onAttachRoutePointButtonClick()
+{
+    if (route_combo_->currentIndex() < 0) {
+        postStatusMessage(tr("Select a route first"));
+        return;
+    }
+    const auto selected_items = available_route_points_list_->selectedItems();
+    if (selected_items.isEmpty()) {
+        postStatusMessage(tr("Select one or more points from the map list"));
+        return;
+    }
+    QStringList point_ids;
+    for (const auto *item : selected_items) {
+        point_ids.push_back(item->data(Qt::UserRole).toString());
+    }
+    sendRouteEdit(
+        sahabat_interfaces::srv::EditRoute::Request::ATTACH_EXISTING_POINTS,
+        route_combo_->currentData().toString(),
+        QString(),
+        QString(),
+        true,
+        QString(),
+        point_ids);
+}
+
+void WaypointEditorPanel::onDetachRoutePointButtonClick()
+{
+    auto *item = route_points_list_->currentItem();
+    if (route_combo_->currentIndex() < 0 || item == nullptr) {
+        postStatusMessage(tr("Select a point in the current route list"));
+        return;
+    }
+    sendRouteEdit(
+        sahabat_interfaces::srv::EditRoute::Request::REMOVE_POINT_FROM_ROUTE,
+        route_combo_->currentData().toString(),
+        QString(),
+        QString(),
+        true,
+        item->data(Qt::UserRole).toString());
+}
+
+void WaypointEditorPanel::onMoveRoutePointEarlierButtonClick()
+{
+    auto *item = route_points_list_->currentItem();
+    if (route_combo_->currentIndex() < 0 || item == nullptr) {
+        postStatusMessage(tr("Select a point in the current route list"));
+        return;
+    }
+    sendRouteEdit(
+        sahabat_interfaces::srv::EditRoute::Request::MOVE_POINT_EARLIER,
+        route_combo_->currentData().toString(),
+        QString(),
+        QString(),
+        true,
+        item->data(Qt::UserRole).toString());
+}
+
+void WaypointEditorPanel::onMoveRoutePointLaterButtonClick()
+{
+    auto *item = route_points_list_->currentItem();
+    if (route_combo_->currentIndex() < 0 || item == nullptr) {
+        postStatusMessage(tr("Select a point in the current route list"));
+        return;
+    }
+    sendRouteEdit(
+        sahabat_interfaces::srv::EditRoute::Request::MOVE_POINT_LATER,
+        route_combo_->currentData().toString(),
+        QString(),
+        QString(),
+        true,
+        item->data(Qt::UserRole).toString());
+}
+
+void WaypointEditorPanel::onDeleteRoutePointsEverywhereButtonClick()
+{
+    const auto selected_items = available_route_points_list_->selectedItems();
+    if (selected_items.isEmpty()) {
+        postStatusMessage(tr("Select one or more points from the map list"));
+        return;
+    }
+    const auto answer = QMessageBox::warning(
+        this,
+        tr("Delete Route Points from Map"),
+        tr("Delete %1 selected point(s) from every route?\n\n"
+           "This is global and cannot be undone after Save WPs + Routes.")
+            .arg(selected_items.size()),
+        QMessageBox::Cancel | QMessageBox::Yes,
+        QMessageBox::Cancel);
+    if (answer != QMessageBox::Yes) {
+        return;
+    }
+    QStringList point_ids;
+    for (const auto *item : selected_items) {
+        point_ids.push_back(item->data(Qt::UserRole).toString());
+    }
+    sendRouteEdit(
+        sahabat_interfaces::srv::EditRoute::Request::DELETE_POINTS_EVERYWHERE,
+        QString(),
+        QString(),
+        QString(),
+        true,
+        QString(),
+        point_ids);
+}
+
+void WaypointEditorPanel::onRouteSelected(int index)
+{
+    if (index < 0) {
+        return;
+    }
+    {
+        QSignalBlocker blocker(route_bidirectional_check_);
+        route_bidirectional_check_->setChecked(
+            route_combo_->itemData(index, Qt::UserRole + 1).toBool());
+    }
+    updateSelectedRouteLabel(index);
+    sendRouteEdit(
+        sahabat_interfaces::srv::EditRoute::Request::SELECT,
+        route_combo_->itemData(index).toString());
+}
+
+void WaypointEditorPanel::onRouteBidirectionalChanged(bool checked)
+{
+    if (route_combo_->currentIndex() < 0) {
+        return;
+    }
+    sendRouteEdit(
+        sahabat_interfaces::srv::EditRoute::Request::SET_BIDIRECTIONAL,
+        route_combo_->currentData().toString(),
+        QString(),
+        QString(),
+        checked);
 }
 
 void WaypointEditorPanel::releaseControlLease(const std::string &lease_id)
@@ -865,6 +1488,15 @@ void WaypointEditorPanel::onLoad2DMapButtonClick()
                     }
                     if (ok) {
                         map_id_ = map_id;
+                        const auto results = nh_->set_parameters({
+                            rclcpp::Parameter("map_id", map_id.toStdString())});
+                        if (!results.empty() && !results.front().successful) {
+                            ok = false;
+                            message = QString::fromStdString(results.front().reason);
+                        } else {
+                            refreshWaypointSets();
+                            refreshWaypoints();
+                        }
                     }
                     postStatusMessage(ok ? tr("Loaded 2D Map") : message);
                 });
@@ -923,8 +1555,15 @@ void WaypointEditorPanel::onLoad2DMapButtonClick()
                         }
                         if (ok) {
                             map_id_ = map_id;
-                            refreshWaypointSets();
-                            refreshWaypoints();
+                            const auto results = nh_->set_parameters({
+                                rclcpp::Parameter("map_id", map_id.toStdString())});
+                            if (!results.empty() && !results.front().successful) {
+                                ok = false;
+                                message = QString::fromStdString(results.front().reason);
+                            } else {
+                                refreshWaypointSets();
+                                refreshWaypoints();
+                            }
                         }
                         postStatusMessage(ok ? tr("Loaded 2D Map") : message);
                         releaseControlLease(lease_id);

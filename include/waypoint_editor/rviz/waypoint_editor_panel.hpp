@@ -11,13 +11,21 @@
 #include <QDoubleSpinBox>
 #include <QLineEdit>
 #include <QComboBox>
+#include <QCheckBox>
+#include <QListWidget>
+#include <QTabWidget>
 #include <QString>
+#include <QStringList>
 
 #include <std_srvs/srv/trigger.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include <std_msgs/msg/empty.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <nav2_msgs/srv/load_map.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sahabat_interfaces/srv/control_lease.hpp>
+#include <sahabat_interfaces/srv/edit_route.hpp>
+#include <sahabat_interfaces/srv/get_waypoint_graph.hpp>
 #include <sahabat_interfaces/srv/get_waypoints.hpp>
 #include <sahabat_interfaces/srv/load_map.hpp>
 #include <sahabat_interfaces/srv/list_waypoint_sets.hpp>
@@ -50,6 +58,16 @@ protected Q_SLOTS:
     void onRenameSetButtonClick();
     void onDeleteSetButtonClick();
     void onRefreshWaypointsButtonClick();
+    void onCreateRouteButtonClick();
+    void onDeleteRouteButtonClick();
+    void onAddRoutePointButtonClick();
+    void onAttachRoutePointButtonClick();
+    void onDetachRoutePointButtonClick();
+    void onMoveRoutePointEarlierButtonClick();
+    void onMoveRoutePointLaterButtonClick();
+    void onDeleteRoutePointsEverywhereButtonClick();
+    void onRouteSelected(int index);
+    void onRouteBidirectionalChanged(bool checked);
     void onGoToWaypointButtonClick();
     void onStopNavigationButtonClick();
     void onMarkerSizeChanged(double value);
@@ -63,6 +81,15 @@ private:
     void postStatusMessage(const QString &msg);
     void refreshWaypointSets();
     void refreshWaypoints();
+    void updateSelectedRouteLabel(int index);
+    void sendRouteEdit(
+        uint8_t action,
+        const QString &segment_id = QString(),
+        const QString &from_waypoint_id = QString(),
+        const QString &to_waypoint_id = QString(),
+        bool bidirectional = true,
+        const QString &route_point_id = QString(),
+        const QStringList &route_point_ids = QStringList());
     void manageWaypointSet(uint8_t action, const QString &set_id, const QString &name);
     void sendPatrolCommand(uint8_t command, const QString &waypoint_id);
     void releaseControlLease(const std::string &lease_id);
@@ -89,6 +116,21 @@ private:
     QPushButton *refresh_waypoints_button_;
     QPushButton *go_waypoint_button_;
     QPushButton *stop_navigation_button_;
+    QComboBox *route_from_combo_;
+    QComboBox *route_to_combo_;
+    QComboBox *route_combo_;
+    QListWidget *route_points_list_;
+    QListWidget *available_route_points_list_;
+    QLabel *selected_route_label_;
+    QPushButton *create_route_button_;
+    QPushButton *delete_route_button_;
+    QPushButton *add_route_point_button_;
+    QPushButton *attach_route_point_button_;
+    QPushButton *detach_route_point_button_;
+    QPushButton *move_route_point_earlier_button_;
+    QPushButton *move_route_point_later_button_;
+    QPushButton *delete_route_points_everywhere_button_;
+    QCheckBox *route_bidirectional_check_;
     QDoubleSpinBox *marker_size_spin_;
     QPushButton *undo_button_;
     QPushButton *redo_button_;
@@ -111,11 +153,15 @@ private:
     rclcpp::Client<sahabat_interfaces::srv::ListWaypointSets>::SharedPtr list_sets_client_;
     rclcpp::Client<sahabat_interfaces::srv::ManageWaypointSet>::SharedPtr manage_set_client_;
     rclcpp::Client<sahabat_interfaces::srv::GetWaypoints>::SharedPtr get_waypoints_client_;
+    rclcpp::Client<sahabat_interfaces::srv::GetWaypointGraph>::SharedPtr get_graph_client_;
+    rclcpp::Client<sahabat_interfaces::srv::EditRoute>::SharedPtr edit_route_client_;
     rclcpp::Client<sahabat_interfaces::srv::ControlLease>::SharedPtr control_lease_client_;
     rclcpp::Client<sahabat_interfaces::srv::PatrolCommand>::SharedPtr patrol_client_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr auto_distance_pub_;
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr last_wp_dist_sub_;
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr total_wp_dist_sub_;
+    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr graph_changed_sub_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr route_point_selected_sub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_pub_;
     QString map_dialog_directory_;
     QString map_id_;

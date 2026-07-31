@@ -25,7 +25,7 @@
 #include <filesystem>
 #include <future>
 #include <regex>
-#include <sstream>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -64,19 +64,6 @@ double YawFromPose(const geometry_msgs::msg::Pose &pose)
     return std::atan2(
         2.0 * (q.w * q.z + q.x * q.y),
         1.0 - 2.0 * (q.y * q.y + q.z * q.z));
-}
-
-std::string EscapeYamlString(const std::string &input)
-{
-    std::ostringstream oss;
-    for (const auto ch : input) {
-        if (ch == '"') {
-            oss << "\\\"";
-        } else {
-            oss << ch;
-        }
-    }
-    return oss.str();
 }
 
 std::string Trim(const std::string &input)
@@ -134,6 +121,7 @@ void WaypointEditorTool::onInitialize()
         [this](const std::vector<rclcpp::Parameter> &params) {
             rcl_interfaces::msg::SetParametersResult result;
             result.successful = true;
+            std::string requested_map_id;
             for (const auto &p : params) {
                 if (p.get_name() == "auto_pose_topic") {
                     auto_pose_topic_ = p.as_string();
@@ -154,6 +142,38 @@ void WaypointEditorTool::onInitialize()
                         result.successful = false;
                         result.reason = "Waypoint marker size must be between 0.10 and 1.00 m";
                     }
+                } else if (p.get_name() == "map_id") {
+                    requested_map_id = Trim(p.as_string());
+                    if (requested_map_id.empty()) {
+                        result.successful = false;
+                        result.reason = "Map id cannot be empty";
+                    }
+                }
+            }
+            if (result.successful &&
+                !requested_map_id.empty() &&
+                requested_map_id != map_id_)
+            {
+                map_id_ = requested_map_id;
+                waypoint_file_ =
+                    (map_directory_ / (map_id_ + "_waypoints.yaml")).string();
+                waypoint_sets_directory_ =
+                    map_directory_ / "waypoint_sets" / map_id_;
+                legacy_waypoint_sets_directory_ =
+                    map_directory_ / map_id_ / "waypoint_sets";
+                waypoint_index_path_ = waypoint_sets_directory_ / "index.yaml";
+                active_set_id_.clear();
+                active_set_name_ = "Default";
+                active_revision_ = 0;
+                std::string error;
+                const bool loaded = usingOperatorBackend()
+                    ? loadOperatorWaypointSet("", error)
+                    : ensureWaypointSets(error) &&
+                      loadWaypointSet(activeSetFromIndex(), error);
+                if (!loaded) {
+                    result.successful = false;
+                    result.reason = "Failed to load waypoints for map '" +
+                        map_id_ + "': " + error;
                 }
             }
             if (result.successful) {
@@ -173,6 +193,8 @@ void WaypointEditorTool::onInitialize()
         operator_lease_client_ = backend_node_->create_client<sahabat_interfaces::srv::ControlLease>("/operator/control_lease");
         operator_get_waypoints_client_ = backend_node_->create_client<sahabat_interfaces::srv::GetWaypoints>("/operator/waypoints/get");
         operator_save_waypoints_client_ = backend_node_->create_client<sahabat_interfaces::srv::SaveWaypoints>("/operator/waypoints/save");
+        operator_get_graph_client_ = backend_node_->create_client<sahabat_interfaces::srv::GetWaypointGraph>("/operator/waypoint_graph/get");
+        operator_save_graph_client_ = backend_node_->create_client<sahabat_interfaces::srv::SaveWaypointGraph>("/operator/waypoint_graph/save");
         operator_list_sets_client_ = backend_node_->create_client<sahabat_interfaces::srv::ListWaypointSets>("/operator/waypoint_sets/list");
         operator_manage_set_client_ = backend_node_->create_client<sahabat_interfaces::srv::ManageWaypointSet>("/operator/waypoint_sets/manage");
     }
@@ -215,6 +237,14 @@ void WaypointEditorTool::onInitialize()
         "waypoint_editor/get_waypoints",
         std::bind(&WaypointEditorTool::handleGetWaypoints, this, _1, _2)
     );
+    get_graph_service_ = nh_->create_service<sahabat_interfaces::srv::GetWaypointGraph>(
+        "waypoint_editor/get_graph",
+        std::bind(&WaypointEditorTool::handleGetWaypointGraph, this, _1, _2)
+    );
+    edit_route_service_ = nh_->create_service<sahabat_interfaces::srv::EditRoute>(
+        "waypoint_editor/edit_route",
+        std::bind(&WaypointEditorTool::handleEditRoute, this, _1, _2)
+    );
     auto_start_service_ = nh_->create_service<std_srvs::srv::Trigger>(
         "start_auto_waypoints",
         [this](const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/, std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
@@ -237,6 +267,9 @@ void WaypointEditorTool::onInitialize()
     line_pub_ = nh_->create_publisher<visualization_msgs::msg::Marker>("waypoint_line", 10);
     total_wp_dist_pub_ = nh_->create_publisher<std_msgs::msg::Float64>("total_wp_dist", 10);
     last_wp_dist_pub_  = nh_->create_publisher<std_msgs::msg::Float64>("last_wp_dist", 10);
+    graph_changed_pub_ = nh_->create_publisher<std_msgs::msg::Empty>("waypoint_editor/graph_changed", 10);
+    route_point_selected_pub_ = nh_->create_publisher<std_msgs::msg::String>(
+        "waypoint_editor/route_point_selected", rclcpp::QoS(10).reliable());
     auto_distance_sub_ = nh_->create_subscription<std_msgs::msg::Float64>(
         "auto_waypoint_min_distance", rclcpp::QoS(1).transient_local(),
         [this](std_msgs::msg::Float64::SharedPtr msg) {
@@ -263,6 +296,7 @@ void WaypointEditorTool::onInitialize()
 void WaypointEditorTool::onPoseSet(double x, double y, double theta)
 {
     Waypoint wp;
+    wp.id = makeWaypointId(add_route_point_armed_ ? "rp" : "wp");
     wp.pose.header.frame_id = "map";
     wp.pose.header.stamp = nh_->now();
     wp.pose.pose.position.x = x;
@@ -278,8 +312,35 @@ void WaypointEditorTool::onPoseSet(double x, double y, double theta)
 
     wp.function_command.clear();
 
-    const int new_id = appendWaypointAndRefresh(std::move(wp));
-    RCLCPP_INFO(nh_->get_logger(), "Added waypoint %d", new_id);
+    if (add_route_point_armed_) {
+        const int segment_index = segmentIndex(active_segment_id_);
+        if (segment_index < 0) {
+            add_route_point_armed_ = false;
+            RCLCPP_WARN(nh_->get_logger(), "No route selected for the new route point");
+            deactivate();
+            return;
+        }
+        auto &segment = route_segments_.at(static_cast<std::size_t>(segment_index));
+        sahabat_interfaces::msg::Waypoint via;
+        via.id = wp.id;
+        via.name = via.id;
+        via.pose.x = x;
+        via.pose.y = y;
+        via.pose.theta = theta;
+        via.dwell_seconds = 0.0;
+        via.enabled = true;
+        segment.via_points.push_back(std::move(via));
+        add_route_point_armed_ = false;
+        updateWaypointMarker();
+        publishRangeMetrics();
+        graph_changed_pub_->publish(std_msgs::msg::Empty());
+        RCLCPP_INFO(
+            nh_->get_logger(), "Added route point to segment '%s'",
+            active_segment_id_.c_str());
+    } else {
+        const int new_id = appendWaypointAndRefresh(std::move(wp));
+        RCLCPP_INFO(nh_->get_logger(), "Added waypoint %d", new_id);
+    }
 
     deactivate();
 }
@@ -291,12 +352,36 @@ void WaypointEditorTool::updateWaypointMarker()
         auto int_marker = createWaypointMarker(static_cast<int>(i));
         server_->insert(int_marker, std::bind(&WaypointEditorTool::processFeedback, this, _1));
     }
+    std::vector<std::size_t> route_order;
+    const int selected_index = segmentIndex(active_segment_id_);
+    if (selected_index >= 0) {
+        route_order.push_back(static_cast<std::size_t>(selected_index));
+    }
+    for (std::size_t i = 0; i < route_segments_.size(); ++i) {
+        if (static_cast<int>(i) != selected_index) {
+            route_order.push_back(i);
+        }
+    }
+    std::set<std::string> rendered_point_ids;
+    for (const std::size_t segment_index : route_order) {
+        const auto &segment = route_segments_[segment_index];
+        for (std::size_t point_index = 0; point_index < segment.via_points.size(); ++point_index) {
+            if (!rendered_point_ids.insert(segment.via_points[point_index].id).second) {
+                continue;
+            }
+            auto marker = createRoutePointMarker(segment_index, point_index);
+            server_->insert(marker, std::bind(&WaypointEditorTool::processFeedback, this, _1));
+        }
+    }
 
     server_->applyChanges();
 }
 
 int WaypointEditorTool::appendWaypointAndRefresh(Waypoint wp)
 {
+    if (wp.id.empty()) {
+        wp.id = makeWaypointId("wp");
+    }
     if (wp.pose.header.frame_id.empty()) {
         wp.pose.header.frame_id = "map";
     }
@@ -521,8 +606,200 @@ visualization_msgs::msg::InteractiveMarker WaypointEditorTool::createWaypointMar
     return int_marker;
 }
 
+visualization_msgs::msg::InteractiveMarker WaypointEditorTool::createRoutePointMarker(
+    std::size_t segment_index, std::size_t point_index)
+{
+    const auto &segment = route_segments_.at(segment_index);
+    const auto &point = segment.via_points.at(point_index);
+    const double size = std::max(0.10, marker_size_ * 0.85);
+    const bool selected = segment.id == active_segment_id_;
+
+    visualization_msgs::msg::InteractiveMarker marker;
+    marker.header.frame_id = "map";
+    marker.name = "route:" + segment.id + ":" + std::to_string(point_index);
+    marker.description = point.name.empty() || point.name == point.id
+        ? routePointTag(point.id)
+        : routePointTag(point.id) + " · " + point.name;
+    marker.scale = selected ? std::max(0.60, size * 3.0) : std::max(0.30, size * 2.0);
+    marker.pose.position.x = point.pose.x;
+    marker.pose.position.y = point.pose.y;
+    marker.pose.orientation.z = std::sin(point.pose.theta / 2.0);
+    marker.pose.orientation.w = std::cos(point.pose.theta / 2.0);
+
+    visualization_msgs::msg::InteractiveMarkerControl move;
+    move.name = "move_route_point";
+    move.interaction_mode = selected
+        ? visualization_msgs::msg::InteractiveMarkerControl::MOVE_PLANE
+        : visualization_msgs::msg::InteractiveMarkerControl::NONE;
+    move.always_visible = true;
+    move.orientation.w = 0.7071;
+    move.orientation.y = 0.7071;
+    if (selected) {
+        visualization_msgs::msg::Marker halo;
+        halo.type = visualization_msgs::msg::Marker::CYLINDER;
+        halo.scale.x = std::max(0.50, size * 2.4);
+        halo.scale.y = std::max(0.50, size * 2.4);
+        halo.scale.z = 0.035;
+        halo.pose.position.z = -0.02;
+        halo.color.r = 0.10;
+        halo.color.g = 0.85;
+        halo.color.b = 1.0;
+        halo.color.a = 0.28;
+        move.markers.push_back(halo);
+    }
+    visualization_msgs::msg::Marker sphere;
+    sphere.type = visualization_msgs::msg::Marker::SPHERE;
+    const double sphere_size = selected ? std::max(0.32, size * 1.45) : size;
+    sphere.scale.x = sphere_size;
+    sphere.scale.y = sphere_size;
+    sphere.scale.z = sphere_size;
+    sphere.color.r = 0.15;
+    sphere.color.g = 0.80;
+    sphere.color.b = 1.0;
+    sphere.color.a = selected ? 1.0 : 0.14;
+    move.markers.push_back(sphere);
+    visualization_msgs::msg::Marker text;
+    text.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+    text.scale.z = selected ? std::max(0.30, size * 1.35) : std::max(0.13, size * 0.60);
+    text.color.r = 0.0;
+    text.color.g = selected ? 0.12 : 0.25;
+    text.color.b = selected ? 0.18 : 0.40;
+    text.color.a = selected ? 1.0 : 0.10;
+    text.text = routePointTag(point.id);
+    text.pose.position.z = selected ? std::max(0.30, size * 1.45) : size;
+    move.markers.push_back(text);
+    marker.controls.push_back(move);
+
+    if (selected) {
+        visualization_msgs::msg::InteractiveMarkerControl menu_control;
+        menu_control.name = "route_point_menu";
+        menu_control.interaction_mode = visualization_msgs::msg::InteractiveMarkerControl::MENU;
+        menu_control.always_visible = true;
+        marker.controls.push_back(menu_control);
+
+        visualization_msgs::msg::MenuEntry delete_entry;
+        delete_entry.id = 101;
+        delete_entry.title = "Remove Point from This Route";
+        marker.menu_entries.push_back(delete_entry);
+        visualization_msgs::msg::MenuEntry rename_entry;
+        rename_entry.id = 102;
+        rename_entry.title = "Rename Shared Route Point";
+        marker.menu_entries.push_back(rename_entry);
+        visualization_msgs::msg::MenuEntry earlier_entry;
+        earlier_entry.id = 103;
+        earlier_entry.title = "Move Earlier in This Route";
+        marker.menu_entries.push_back(earlier_entry);
+        visualization_msgs::msg::MenuEntry later_entry;
+        later_entry.id = 104;
+        later_entry.title = "Move Later in This Route";
+        marker.menu_entries.push_back(later_entry);
+    }
+    return marker;
+}
+
 void WaypointEditorTool::processFeedback(const std::shared_ptr<const visualization_msgs::msg::InteractiveMarkerFeedback> &fb)
 {
+    if (fb->marker_name.rfind("route:", 0) == 0) {
+        const auto last_separator = fb->marker_name.rfind(':');
+        if (last_separator == std::string::npos || last_separator <= 6) {
+            return;
+        }
+        const std::string segment_id = fb->marker_name.substr(6, last_separator - 6);
+        const int segment_index = segmentIndex(segment_id);
+        int point_index = -1;
+        try {
+            point_index = std::stoi(fb->marker_name.substr(last_separator + 1));
+        } catch (const std::exception &) {
+            return;
+        }
+        if (segment_index < 0 || point_index < 0) {
+            return;
+        }
+        auto &segment = route_segments_.at(static_cast<std::size_t>(segment_index));
+        if (point_index >= static_cast<int>(segment.via_points.size())) {
+            return;
+        }
+        auto &point = segment.via_points.at(static_cast<std::size_t>(point_index));
+        if (
+            fb->event_type == visualization_msgs::msg::InteractiveMarkerFeedback::MOUSE_DOWN ||
+            fb->event_type == visualization_msgs::msg::InteractiveMarkerFeedback::BUTTON_CLICK)
+        {
+            std_msgs::msg::String selected_point;
+            selected_point.data = point.id;
+            route_point_selected_pub_->publish(selected_point);
+        }
+        if (fb->event_type == visualization_msgs::msg::InteractiveMarkerFeedback::POSE_UPDATE) {
+            const std::string shared_id = point.id;
+            for (auto &route : route_segments_) {
+                for (auto &shared_point : route.via_points) {
+                    if (shared_point.id == shared_id) {
+                        shared_point.pose.x = fb->pose.position.x;
+                        shared_point.pose.y = fb->pose.position.y;
+                        shared_point.pose.theta = YawFromPose(fb->pose);
+                    }
+                }
+            }
+            server_->setPose(fb->marker_name, fb->pose);
+            server_->applyChanges();
+            publishRangeMetrics();
+        } else if (
+            fb->event_type == visualization_msgs::msg::InteractiveMarkerFeedback::MENU_SELECT &&
+            fb->menu_entry_id == 101)
+        {
+            segment.via_points.erase(
+                segment.via_points.begin() + static_cast<std::ptrdiff_t>(point_index));
+            updateWaypointMarker();
+            publishRangeMetrics();
+            graph_changed_pub_->publish(std_msgs::msg::Empty());
+        } else if (
+            fb->event_type == visualization_msgs::msg::InteractiveMarkerFeedback::MENU_SELECT &&
+            fb->menu_entry_id == 102)
+        {
+            bool ok = false;
+            const QString name = QInputDialog::getText(
+                nullptr,
+                tr("Rename Route Point"),
+                tr("Route point name:"),
+                QLineEdit::Normal,
+                QString::fromStdString(point.name),
+                &ok);
+            if (ok && !name.trimmed().isEmpty()) {
+                const std::string shared_id = point.id;
+                for (auto &route : route_segments_) {
+                    for (auto &shared_point : route.via_points) {
+                        if (shared_point.id == shared_id) {
+                            shared_point.name = name.trimmed().toStdString();
+                        }
+                    }
+                }
+                updateWaypointMarker();
+                graph_changed_pub_->publish(std_msgs::msg::Empty());
+            }
+        } else if (
+            fb->event_type == visualization_msgs::msg::InteractiveMarkerFeedback::MENU_SELECT &&
+            fb->menu_entry_id == 103 && point_index > 0)
+        {
+            std::swap(
+                segment.via_points[static_cast<std::size_t>(point_index)],
+                segment.via_points[static_cast<std::size_t>(point_index - 1)]);
+            updateWaypointMarker();
+            publishRangeMetrics();
+            graph_changed_pub_->publish(std_msgs::msg::Empty());
+        } else if (
+            fb->event_type == visualization_msgs::msg::InteractiveMarkerFeedback::MENU_SELECT &&
+            fb->menu_entry_id == 104 &&
+            point_index + 1 < static_cast<int>(segment.via_points.size()))
+        {
+            std::swap(
+                segment.via_points[static_cast<std::size_t>(point_index)],
+                segment.via_points[static_cast<std::size_t>(point_index + 1)]);
+            updateWaypointMarker();
+            publishRangeMetrics();
+            graph_changed_pub_->publish(std_msgs::msg::Empty());
+        }
+        return;
+    }
+
     const int id = std::stoi(fb->marker_name);
     if (!isValidWaypointId(id)) {
         return;
@@ -577,6 +854,8 @@ void WaypointEditorTool::processMenuControl(const std::shared_ptr<const visualiz
       
         // Delete Waypoint
         case 1:
+            removeSegmentsForWaypoint(
+                waypoint_sequence_.at(static_cast<std::size_t>(id)).id);
             waypoint_sequence_.eraseWaypoint(static_cast<std::size_t>(id));
             updateWaypointMarker();
             commitWaypointChanges(id);
@@ -684,27 +963,76 @@ void WaypointEditorTool::updateLastDistanceFromWaypoint(int waypoint_index)
 
 void WaypointEditorTool::publishLineMarker()
 {
-    visualization_msgs::msg::Marker line;
-    line.header.frame_id = "map";
-    line.header.stamp = nh_->now();
-    line.ns = "waypoint_lines";
-    line.id = 0;
-    line.type = visualization_msgs::msg::Marker::LINE_LIST;
-    line.action  = visualization_msgs::msg::Marker::ADD;
-    line.scale.x = 0.025f;
-    line.color.r = 0.0f;
-    line.color.g  = 1.0f;
-    line.color.b  = 0.0f;
-    line.color.a  = 1.0f;
-
+    visualization_msgs::msg::Marker clear;
+    clear.header.frame_id = "map";
+    clear.header.stamp = nh_->now();
+    clear.action = visualization_msgs::msg::Marker::DELETEALL;
+    line_pub_->publish(clear);
     const auto &waypoints = waypoint_sequence_.waypoints();
-    for (size_t i = 1; i < waypoints.size(); ++i) {
-        geometry_msgs::msg::Point p0 = waypoints[i-1].pose.pose.position;
-        geometry_msgs::msg::Point p1 = waypoints[i].pose.pose.position;
-        line.points.push_back(p0);
-        line.points.push_back(p1);
+    if (route_segments_.empty()) {
+        visualization_msgs::msg::Marker line;
+        line.header.frame_id = "map";
+        line.header.stamp = nh_->now();
+        line.ns = "waypoint_lines";
+        line.id = 0;
+        line.type = visualization_msgs::msg::Marker::LINE_LIST;
+        line.action = visualization_msgs::msg::Marker::ADD;
+        line.scale.x = 0.025f;
+        line.color.g = 1.0f;
+        line.color.a = 1.0f;
+        for (size_t i = 1; i < waypoints.size(); ++i) {
+            line.points.push_back(waypoints[i - 1].pose.pose.position);
+            line.points.push_back(waypoints[i].pose.pose.position);
+        }
+        line_pub_->publish(line);
+        return;
     }
-    line_pub_->publish(line);
+
+    std::vector<std::size_t> order;
+    order.reserve(route_segments_.size());
+    for (std::size_t i = 0; i < route_segments_.size(); ++i) {
+        if (route_segments_[i].id != active_segment_id_) {
+            order.push_back(i);
+        }
+    }
+    const int selected_index = segmentIndex(active_segment_id_);
+    if (selected_index >= 0) {
+        order.push_back(static_cast<std::size_t>(selected_index));
+    }
+
+    for (const std::size_t segment_index : order) {
+        const auto &segment = route_segments_[segment_index];
+        const int from_index = waypointIndexById(segment.from_waypoint_id);
+        const int to_index = waypointIndexById(segment.to_waypoint_id);
+        if (from_index < 0 || to_index < 0 || !segment.enabled) {
+            continue;
+        }
+        const bool selected = segment.id == active_segment_id_;
+        visualization_msgs::msg::Marker line;
+        line.header.frame_id = "map";
+        line.header.stamp = nh_->now();
+        line.ns = "waypoint_lines";
+        line.id = static_cast<int>(segment_index) + 1;
+        line.type = visualization_msgs::msg::Marker::LINE_STRIP;
+        line.action = visualization_msgs::msg::Marker::ADD;
+        line.scale.x = selected ? 0.14f : 0.018f;
+        line.color.r = selected ? 0.05f : 0.45f;
+        line.color.g = selected ? 0.82f : 0.65f;
+        line.color.b = 1.0f;
+        line.color.a = selected ? 1.0f : 0.06f;
+        line.points.push_back(
+            waypoints.at(static_cast<std::size_t>(from_index)).pose.pose.position);
+        for (const auto &via : segment.via_points) {
+            geometry_msgs::msg::Point point;
+            point.x = via.pose.x;
+            point.y = via.pose.y;
+            point.z = 0.03;
+            line.points.push_back(point);
+        }
+        line.points.push_back(
+            waypoints.at(static_cast<std::size_t>(to_index)).pose.pose.position);
+        line_pub_->publish(line);
+    }
 }
 
 void WaypointEditorTool::publishTotalWpsDist()
@@ -741,6 +1069,84 @@ void WaypointEditorTool::commitWaypointChanges(int waypoint_index, bool snapshot
 bool WaypointEditorTool::isValidWaypointId(int id) const
 {
     return id >= 0 && id < static_cast<int>(waypoint_sequence_.size());
+}
+
+std::string WaypointEditorTool::makeWaypointId(const std::string &prefix) const
+{
+    int suffix = 1;
+    while (true) {
+        std::string suffix_text = std::to_string(suffix++);
+        if (prefix == "rp" && suffix_text.size() < 3) {
+            suffix_text.insert(0, 3 - suffix_text.size(), '0');
+        }
+        const std::string candidate = prefix + "-" + suffix_text;
+        bool used = std::any_of(
+            waypoint_sequence_.waypoints().begin(),
+            waypoint_sequence_.waypoints().end(),
+            [&candidate](const Waypoint &waypoint) {
+                return waypoint.id == candidate;
+            });
+        if (!used) {
+            for (const auto &segment : route_segments_) {
+                used = used || segment.id == candidate;
+                used = used || std::any_of(
+                    segment.via_points.begin(), segment.via_points.end(),
+                    [&candidate](const sahabat_interfaces::msg::Waypoint &point) {
+                        return point.id == candidate;
+                    });
+            }
+        }
+        if (!used) {
+            return candidate;
+        }
+    }
+}
+
+int WaypointEditorTool::segmentIndex(const std::string &segment_id) const
+{
+    for (std::size_t i = 0; i < route_segments_.size(); ++i) {
+        if (route_segments_[i].id == segment_id) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+std::string WaypointEditorTool::routePointTag(const std::string &point_id) const
+{
+    return point_id.empty() ? "rp-???" : point_id;
+}
+
+int WaypointEditorTool::waypointIndexById(const std::string &waypoint_id) const
+{
+    for (std::size_t i = 0; i < waypoint_sequence_.size(); ++i) {
+        if (waypoint_sequence_.at(i).id == waypoint_id) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+void WaypointEditorTool::removeSegmentsForWaypoint(const std::string &waypoint_id)
+{
+    route_segments_.erase(
+        std::remove_if(
+            route_segments_.begin(), route_segments_.end(),
+            [&waypoint_id](const sahabat_interfaces::msg::RouteSegment &segment) {
+                return segment.from_waypoint_id == waypoint_id ||
+                       segment.to_waypoint_id == waypoint_id;
+            }),
+        route_segments_.end());
+    if (segmentIndex(active_segment_id_) < 0) {
+        active_segment_id_.clear();
+        add_route_point_armed_ = false;
+    }
+}
+
+void WaypointEditorTool::refreshRouteVisualization()
+{
+    updateWaypointMarker();
+    publishRangeMetrics();
 }
 
 bool WaypointEditorTool::usingOperatorBackend() const
@@ -785,16 +1191,16 @@ void WaypointEditorTool::releaseOperatorLease(const std::string &lease_id)
 
 bool WaypointEditorTool::loadOperatorWaypointSet(const std::string &set_id, std::string &error)
 {
-    if (!operator_get_waypoints_client_ || !operator_get_waypoints_client_->wait_for_service(std::chrono::seconds(2))) {
-        error = "Operator waypoint load service unavailable";
+    if (!operator_get_graph_client_ || !operator_get_graph_client_->wait_for_service(std::chrono::seconds(2))) {
+        error = "Operator waypoint graph load service unavailable";
         return false;
     }
-    auto req = std::make_shared<sahabat_interfaces::srv::GetWaypoints::Request>();
+    auto req = std::make_shared<sahabat_interfaces::srv::GetWaypointGraph::Request>();
     req->map_id = map_id_;
     req->set_id = set_id;
-    auto future = operator_get_waypoints_client_->async_send_request(req);
+    auto future = operator_get_graph_client_->async_send_request(req);
     if (future.wait_for(std::chrono::seconds(3)) != std::future_status::ready) {
-        error = "Timed out loading operator waypoints";
+        error = "Timed out loading operator waypoint graph";
         return false;
     }
     auto response = future.get();
@@ -806,6 +1212,7 @@ bool WaypointEditorTool::loadOperatorWaypointSet(const std::string &set_id, std:
     std::vector<Waypoint> loaded;
     for (const auto &item : response->waypoints) {
         Waypoint waypoint;
+        waypoint.id = item.id;
         waypoint.pose.header.frame_id = "map";
         waypoint.pose.header.stamp = nh_->now();
         waypoint.pose.pose.position.x = item.pose.x;
@@ -820,6 +1227,14 @@ bool WaypointEditorTool::loadOperatorWaypointSet(const std::string &set_id, std:
         waypoint.function_command = item.name;
         loaded.emplace_back(std::move(waypoint));
     }
+    for (std::size_t i = 0; i < loaded.size(); ++i) {
+        if (loaded[i].id.empty()) {
+            loaded[i].id = std::to_string(i);
+        }
+    }
+    route_segments_ = response->segments;
+    active_segment_id_ = route_segments_.empty() ? "" : route_segments_.front().id;
+    add_route_point_armed_ = false;
 
     active_set_id_ = response->set_id;
     active_set_name_ = response->set_id;
@@ -855,13 +1270,13 @@ bool WaypointEditorTool::saveOperatorWaypointSet(std::string &error)
         return false;
     }
     auto release = [this, &lease_id]() { releaseOperatorLease(lease_id); };
-    if (!operator_save_waypoints_client_ || !operator_save_waypoints_client_->wait_for_service(std::chrono::seconds(2))) {
-        error = "Operator waypoint save service unavailable";
+    if (!operator_save_graph_client_ || !operator_save_graph_client_->wait_for_service(std::chrono::seconds(2))) {
+        error = "Operator waypoint graph save service unavailable";
         release();
         return false;
     }
     auto make_request = [this, &lease_id](uint64_t expected_revision) {
-        auto req = std::make_shared<sahabat_interfaces::srv::SaveWaypoints::Request>();
+        auto req = std::make_shared<sahabat_interfaces::srv::SaveWaypointGraph::Request>();
         req->map_id = map_id_;
         req->set_id = active_set_id_;
         req->expected_revision = expected_revision;
@@ -869,7 +1284,7 @@ bool WaypointEditorTool::saveOperatorWaypointSet(std::string &error)
         for (std::size_t i = 0; i < waypoint_sequence_.size(); ++i) {
             const auto &wp = waypoint_sequence_.at(i);
             sahabat_interfaces::msg::Waypoint item;
-            item.id = std::to_string(i);
+            item.id = wp.id.empty() ? std::to_string(i) : wp.id;
             item.name = wp.function_command.empty() ? "waypoint_" + std::to_string(i + 1) : wp.function_command;
             item.pose.x = wp.pose.pose.position.x;
             item.pose.y = wp.pose.pose.position.y;
@@ -878,11 +1293,12 @@ bool WaypointEditorTool::saveOperatorWaypointSet(std::string &error)
             item.enabled = true;
             req->waypoints.push_back(item);
         }
+        req->segments = route_segments_;
         return req;
     };
 
     auto req = make_request(static_cast<uint64_t>(std::max(0, active_revision_)));
-    auto future = operator_save_waypoints_client_->async_send_request(req);
+    auto future = operator_save_graph_client_->async_send_request(req);
     if (future.wait_for(std::chrono::seconds(3)) != std::future_status::ready) {
         error = "Timed out saving operator waypoints";
         release();
@@ -892,7 +1308,7 @@ bool WaypointEditorTool::saveOperatorWaypointSet(std::string &error)
     if (!response->success && response->revision != static_cast<uint64_t>(std::max(0, active_revision_))) {
         active_revision_ = static_cast<int>(response->revision);
         req = make_request(response->revision);
-        future = operator_save_waypoints_client_->async_send_request(req);
+        future = operator_save_graph_client_->async_send_request(req);
         if (future.wait_for(std::chrono::seconds(3)) != std::future_status::ready) {
             error = "Timed out retrying operator waypoint save";
             release();
@@ -1016,25 +1432,62 @@ bool WaypointEditorTool::writeWaypointSetFile(const std::string &set_id, const s
         return false;
     }
     const auto path = waypoint_sets_directory_ / (set_id + ".yaml");
+    YAML::Node root;
+    root["name"] = Trim(name).empty() ? set_id : Trim(name);
+    root["revision"] = revision;
+    YAML::Node waypoint_nodes(YAML::NodeType::Sequence);
+    for (std::size_t i = 0; i < waypoints.size(); ++i) {
+        const auto &wp = waypoints[i];
+        const auto waypoint_name = wp.function_command.empty() ? "waypoint_" + std::to_string(i + 1) : wp.function_command;
+        YAML::Node item;
+        item["id"] = wp.id.empty() ? std::to_string(i) : wp.id;
+        item["name"] = waypoint_name;
+        item["x"] = wp.pose.pose.position.x;
+        item["y"] = wp.pose.pose.position.y;
+        item["yaw"] = YawFromPose(wp.pose.pose);
+        item["dwell_seconds"] = 0.0;
+        item["enabled"] = true;
+        waypoint_nodes.push_back(item);
+    }
+    root["waypoints"] = waypoint_nodes;
+
+    if (!route_segments_.empty()) {
+        YAML::Node segment_nodes(YAML::NodeType::Sequence);
+        for (const auto &segment : route_segments_) {
+            YAML::Node item;
+            item["id"] = segment.id;
+            item["name"] = segment.name;
+            item["from_waypoint_id"] = segment.from_waypoint_id;
+            item["to_waypoint_id"] = segment.to_waypoint_id;
+            item["bidirectional"] = segment.bidirectional;
+            item["enabled"] = segment.enabled;
+            YAML::Node via_nodes(YAML::NodeType::Sequence);
+            for (const auto &via : segment.via_points) {
+                YAML::Node via_node;
+                via_node["id"] = via.id;
+                via_node["name"] = via.name;
+                via_node["x"] = via.pose.x;
+                via_node["y"] = via.pose.y;
+                via_node["yaw"] = via.pose.theta;
+                via_node["dwell_seconds"] = 0.0;
+                via_node["enabled"] = via.enabled;
+                via_nodes.push_back(via_node);
+            }
+            item["via_points"] = via_nodes;
+            segment_nodes.push_back(item);
+        }
+        root["segments"] = segment_nodes;
+    }
+    if (route_settings_ && route_settings_.IsMap()) {
+        root["settings"] = route_settings_;
+    }
+
     std::ofstream ofs(path);
     if (!ofs.is_open()) {
         error = "Failed to write " + path.string();
         return false;
     }
-    ofs << "name: \"" << EscapeYamlString(Trim(name).empty() ? set_id : Trim(name)) << "\"\n";
-    ofs << "revision: " << revision << "\n";
-    ofs << "waypoints:\n";
-    for (std::size_t i = 0; i < waypoints.size(); ++i) {
-        const auto &wp = waypoints[i];
-        const auto waypoint_name = wp.function_command.empty() ? "waypoint_" + std::to_string(i + 1) : wp.function_command;
-        ofs << "- id: \"" << i << "\"\n";
-        ofs << "  name: \"" << EscapeYamlString(waypoint_name) << "\"\n";
-        ofs << "  x: " << wp.pose.pose.position.x << "\n";
-        ofs << "  y: " << wp.pose.pose.position.y << "\n";
-        ofs << "  yaw: " << YawFromPose(wp.pose.pose) << "\n";
-        ofs << "  dwell_seconds: 0.0\n";
-        ofs << "  enabled: true\n";
-    }
+    ofs << root << "\n";
     error.clear();
     return true;
 }
@@ -1091,6 +1544,63 @@ bool WaypointEditorTool::ensureWaypointSets(std::string &error)
     return writeActiveSetIndex("default", error);
 }
 
+bool WaypointEditorTool::loadGraphFromYaml(
+    const std::filesystem::path &path, std::string &error)
+{
+    try {
+        const YAML::Node root = YAML::LoadFile(path.string());
+        route_segments_.clear();
+        const YAML::Node segments = root["segments"];
+        if (segments && segments.IsSequence()) {
+            for (const auto &node : segments) {
+                if (!node.IsMap()) {
+                    continue;
+                }
+                sahabat_interfaces::msg::RouteSegment segment;
+                segment.id = node["id"] ? node["id"].as<std::string>() : makeWaypointId("route");
+                segment.name = node["name"] ? node["name"].as<std::string>() : segment.id;
+                segment.from_waypoint_id = node["from_waypoint_id"]
+                    ? node["from_waypoint_id"].as<std::string>() : "";
+                segment.to_waypoint_id = node["to_waypoint_id"]
+                    ? node["to_waypoint_id"].as<std::string>() : "";
+                segment.bidirectional = node["bidirectional"]
+                    ? node["bidirectional"].as<bool>() : true;
+                segment.enabled = node["enabled"] ? node["enabled"].as<bool>() : true;
+                const YAML::Node via_points = node["via_points"];
+                if (via_points && via_points.IsSequence()) {
+                    for (const auto &via_node : via_points) {
+                        sahabat_interfaces::msg::Waypoint via;
+                        via.id = via_node["id"]
+                            ? via_node["id"].as<std::string>() : makeWaypointId("via");
+                        via.name = via_node["name"]
+                            ? via_node["name"].as<std::string>() : "route_point";
+                        via.pose.x = via_node["x"] ? via_node["x"].as<double>() : 0.0;
+                        via.pose.y = via_node["y"] ? via_node["y"].as<double>() : 0.0;
+                        via.pose.theta = via_node["yaw"] ? via_node["yaw"].as<double>() : 0.0;
+                        via.dwell_seconds = 0.0;
+                        via.enabled = via_node["enabled"] ? via_node["enabled"].as<bool>() : true;
+                        segment.via_points.push_back(std::move(via));
+                    }
+                }
+                if (!segment.id.empty()) {
+                    route_segments_.push_back(std::move(segment));
+                }
+            }
+        }
+        const YAML::Node settings = root["settings"];
+        route_settings_ = settings && settings.IsMap()
+            ? YAML::Clone(settings)
+            : YAML::Node(YAML::NodeType::Map);
+        active_segment_id_ = route_segments_.empty() ? "" : route_segments_.front().id;
+        add_route_point_armed_ = false;
+        error.clear();
+        return true;
+    } catch (const YAML::Exception &ex) {
+        error = "Failed to parse route graph: " + std::string(ex.what());
+        return false;
+    }
+}
+
 bool WaypointEditorTool::loadWaypointSet(const std::string &set_id, std::string &error)
 {
     if (!validSetId(set_id)) {
@@ -1104,6 +1614,14 @@ bool WaypointEditorTool::loadWaypointSet(const std::string &set_id, std::string 
     }
     std::vector<Waypoint> loaded;
     if (!io::WaypointYaml::Load(path.string(), loaded, error)) {
+        return false;
+    }
+    for (std::size_t i = 0; i < loaded.size(); ++i) {
+        if (loaded[i].id.empty()) {
+            loaded[i].id = std::to_string(i);
+        }
+    }
+    if (!loadGraphFromYaml(path, error)) {
         return false;
     }
     try {
@@ -1400,15 +1918,15 @@ void WaypointEditorTool::handleManageWaypointSet(
             active_set_id_ = response->set_id;
             active_set_name_ = Trim(req->name).empty() ? response->set_id : Trim(req->name);
             active_revision_ = 0;
-            if (!operator_save_waypoints_client_ || !operator_save_waypoints_client_->wait_for_service(std::chrono::seconds(2))) {
+            if (!operator_save_graph_client_ || !operator_save_graph_client_->wait_for_service(std::chrono::seconds(2))) {
                 active_set_id_ = previous_set;
                 active_revision_ = previous_revision;
                 res->success = false;
-                res->message = "Operator waypoint save service unavailable";
+                res->message = "Operator waypoint graph save service unavailable";
                 release();
                 return;
             }
-            auto save_req = std::make_shared<sahabat_interfaces::srv::SaveWaypoints::Request>();
+            auto save_req = std::make_shared<sahabat_interfaces::srv::SaveWaypointGraph::Request>();
             save_req->map_id = map_id_;
             save_req->set_id = active_set_id_;
             save_req->expected_revision = 0;
@@ -1416,7 +1934,7 @@ void WaypointEditorTool::handleManageWaypointSet(
             for (std::size_t i = 0; i < waypoint_sequence_.size(); ++i) {
                 const auto &wp = waypoint_sequence_.at(i);
                 sahabat_interfaces::msg::Waypoint item;
-                item.id = std::to_string(i);
+                item.id = wp.id.empty() ? std::to_string(i) : wp.id;
                 item.name = wp.function_command.empty() ? "waypoint_" + std::to_string(i + 1) : wp.function_command;
                 item.pose.x = wp.pose.pose.position.x;
                 item.pose.y = wp.pose.pose.position.y;
@@ -1425,7 +1943,8 @@ void WaypointEditorTool::handleManageWaypointSet(
                 item.enabled = true;
                 save_req->waypoints.push_back(item);
             }
-            auto save_future = operator_save_waypoints_client_->async_send_request(save_req);
+            save_req->segments = route_segments_;
+            auto save_future = operator_save_graph_client_->async_send_request(save_req);
             if (save_future.wait_for(std::chrono::seconds(3)) != std::future_status::ready) {
                 active_set_id_ = previous_set;
                 active_revision_ = previous_revision;
@@ -1582,7 +2101,7 @@ void WaypointEditorTool::handleGetWaypoints(
     for (std::size_t i = 0; i < waypoint_sequence_.size(); ++i) {
         const auto &wp = waypoint_sequence_.at(i);
         sahabat_interfaces::msg::Waypoint item;
-        item.id = std::to_string(i);
+        item.id = wp.id.empty() ? std::to_string(i) : wp.id;
         item.name = wp.function_command.empty()
             ? "waypoint_" + std::to_string(i + 1)
             : wp.function_command;
@@ -1597,6 +2116,272 @@ void WaypointEditorTool::handleGetWaypoints(
         + " waypoint(s) in current editor set";
 }
 
+void WaypointEditorTool::handleGetWaypointGraph(
+    const std::shared_ptr<sahabat_interfaces::srv::GetWaypointGraph::Request> req,
+    std::shared_ptr<sahabat_interfaces::srv::GetWaypointGraph::Response> res)
+{
+    if (!req->set_id.empty() && req->set_id != active_set_id_) {
+        std::string error;
+        const bool loaded = usingOperatorBackend()
+            ? loadOperatorWaypointSet(req->set_id, error)
+            : loadWaypointSet(req->set_id, error);
+        if (!loaded) {
+            res->message = error;
+            return;
+        }
+    }
+    res->revision = static_cast<uint64_t>(std::max(0, active_revision_));
+    res->set_id = active_set_id_;
+    res->active_segment_id = active_segment_id_;
+    for (std::size_t i = 0; i < waypoint_sequence_.size(); ++i) {
+        const auto &wp = waypoint_sequence_.at(i);
+        sahabat_interfaces::msg::Waypoint item;
+        item.id = wp.id.empty() ? std::to_string(i) : wp.id;
+        item.name = wp.function_command.empty()
+            ? "waypoint_" + std::to_string(i + 1)
+            : wp.function_command;
+        item.pose.x = wp.pose.pose.position.x;
+        item.pose.y = wp.pose.pose.position.y;
+        item.pose.theta = YawFromPose(wp.pose.pose);
+        item.dwell_seconds = 0.0;
+        item.enabled = true;
+        res->waypoints.push_back(std::move(item));
+    }
+    res->segments = route_segments_;
+    res->message = std::to_string(res->waypoints.size()) + " waypoint(s), " +
+        std::to_string(res->segments.size()) + " route segment(s) in editor";
+}
+
+void WaypointEditorTool::handleEditRoute(
+    const std::shared_ptr<sahabat_interfaces::srv::EditRoute::Request> req,
+    std::shared_ptr<sahabat_interfaces::srv::EditRoute::Response> res)
+{
+    using Service = sahabat_interfaces::srv::EditRoute;
+    if (req->action == Service::Request::CREATE) {
+        const int from_index = waypointIndexById(req->from_waypoint_id);
+        const int to_index = waypointIndexById(req->to_waypoint_id);
+        if (from_index < 0 || to_index < 0) {
+            res->message = "Select two valid main waypoints";
+            return;
+        }
+        if (from_index == to_index) {
+            res->message = "Route endpoints must be different";
+            return;
+        }
+        const auto duplicate = std::find_if(
+            route_segments_.begin(), route_segments_.end(),
+            [&req](const sahabat_interfaces::msg::RouteSegment &segment) {
+                return segment.from_waypoint_id == req->from_waypoint_id &&
+                       segment.to_waypoint_id == req->to_waypoint_id;
+            });
+        if (duplicate != route_segments_.end()) {
+            active_segment_id_ = duplicate->id;
+            refreshRouteVisualization();
+            res->active_segment_id = active_segment_id_;
+            res->message = "That route already exists; selected it";
+            res->success = true;
+            return;
+        }
+        sahabat_interfaces::msg::RouteSegment segment;
+        segment.id = makeWaypointId("route");
+        const auto &from = waypoint_sequence_.at(static_cast<std::size_t>(from_index));
+        const auto &to = waypoint_sequence_.at(static_cast<std::size_t>(to_index));
+        const std::string from_name = from.function_command.empty() ? from.id : from.function_command;
+        const std::string to_name = to.function_command.empty() ? to.id : to.function_command;
+        segment.name = from_name + " to " + to_name;
+        segment.from_waypoint_id = req->from_waypoint_id;
+        segment.to_waypoint_id = req->to_waypoint_id;
+        segment.bidirectional = req->bidirectional;
+        segment.enabled = true;
+        active_segment_id_ = segment.id;
+        route_segments_.push_back(std::move(segment));
+        refreshRouteVisualization();
+        res->message = "Route created; add route points where you want the robot to pass";
+    } else if (req->action == Service::Request::DELETE) {
+        const int index = segmentIndex(req->segment_id);
+        if (index < 0) {
+            res->message = "Select a route first";
+            return;
+        }
+        route_segments_.erase(route_segments_.begin() + index);
+        active_segment_id_ = route_segments_.empty() ? "" : route_segments_.front().id;
+        add_route_point_armed_ = false;
+        refreshRouteVisualization();
+        res->message = "Route deleted";
+    } else if (req->action == Service::Request::SELECT) {
+        if (segmentIndex(req->segment_id) < 0) {
+            res->message = "Selected route no longer exists";
+            return;
+        }
+        active_segment_id_ = req->segment_id;
+        add_route_point_armed_ = false;
+        refreshRouteVisualization();
+        res->message = "Route selected";
+    } else if (req->action == Service::Request::ARM_ADD_POINT) {
+        if (segmentIndex(req->segment_id.empty() ? active_segment_id_ : req->segment_id) < 0) {
+            res->message = "Create or select a route first";
+            return;
+        }
+        if (!req->segment_id.empty()) {
+            active_segment_id_ = req->segment_id;
+        }
+        add_route_point_armed_ = true;
+        res->message = "Next Add Waypoint map click will create a route point";
+    } else if (req->action == Service::Request::CANCEL_ADD_POINT) {
+        add_route_point_armed_ = false;
+        res->message = "Route-point placement canceled";
+    } else if (req->action == Service::Request::SET_BIDIRECTIONAL) {
+        const int index = segmentIndex(req->segment_id);
+        if (index < 0) {
+            res->message = "Select a route first";
+            return;
+        }
+        route_segments_.at(static_cast<std::size_t>(index)).bidirectional =
+            req->bidirectional;
+        res->message = req->bidirectional
+            ? "Route is usable in both directions"
+            : "Route is one-way from From to To";
+    } else if (req->action == Service::Request::ATTACH_EXISTING_POINTS) {
+        const int target_index = segmentIndex(req->segment_id);
+        if (target_index < 0) {
+            res->message = "Select a route first";
+            return;
+        }
+        auto &target = route_segments_.at(static_cast<std::size_t>(target_index));
+        std::set<std::string> requested_ids(
+            req->route_point_ids.begin(), req->route_point_ids.end());
+        if (!req->route_point_id.empty()) {
+            requested_ids.insert(req->route_point_id);
+        }
+        int added = 0;
+        for (const auto &requested_id : requested_ids) {
+            if (std::any_of(
+                    target.via_points.begin(), target.via_points.end(),
+                    [&requested_id](const sahabat_interfaces::msg::Waypoint &point) {
+                        return point.id == requested_id;
+                    }))
+            {
+                continue;
+            }
+            sahabat_interfaces::msg::Waypoint existing;
+            bool found_existing = false;
+            for (const auto &route : route_segments_) {
+                const auto found = std::find_if(
+                    route.via_points.begin(), route.via_points.end(),
+                    [&requested_id](const sahabat_interfaces::msg::Waypoint &point) {
+                        return point.id == requested_id;
+                    });
+                if (found != route.via_points.end()) {
+                    existing = *found;
+                    found_existing = true;
+                    break;
+                }
+            }
+            if (found_existing) {
+                target.via_points.push_back(std::move(existing));
+                ++added;
+            }
+        }
+        if (added == 0) {
+            res->message = "No new points added; selected points are already in this route";
+            return;
+        }
+        active_segment_id_ = target.id;
+        refreshRouteVisualization();
+        res->message = std::to_string(added) +
+            " existing point(s) added to this route; shared poses stay synchronized";
+    } else if (req->action == Service::Request::REMOVE_POINT_FROM_ROUTE) {
+        const int target_index = segmentIndex(req->segment_id);
+        if (target_index < 0) {
+            res->message = "Select a route first";
+            return;
+        }
+        auto &points = route_segments_.at(static_cast<std::size_t>(target_index)).via_points;
+        const auto point = std::find_if(
+            points.begin(), points.end(),
+            [&req](const sahabat_interfaces::msg::Waypoint &candidate) {
+                return candidate.id == req->route_point_id;
+            });
+        if (point == points.end()) {
+            res->message = "Selected point is not in this route";
+            return;
+        }
+        points.erase(point);
+        refreshRouteVisualization();
+        res->message = "Point removed from this route only";
+    } else if (
+        req->action == Service::Request::MOVE_POINT_EARLIER ||
+        req->action == Service::Request::MOVE_POINT_LATER)
+    {
+        const int target_index = segmentIndex(req->segment_id);
+        if (target_index < 0) {
+            res->message = "Select a route first";
+            return;
+        }
+        auto &points = route_segments_.at(static_cast<std::size_t>(target_index)).via_points;
+        const auto point = std::find_if(
+            points.begin(), points.end(),
+            [&req](const sahabat_interfaces::msg::Waypoint &candidate) {
+                return candidate.id == req->route_point_id;
+            });
+        if (point == points.end()) {
+            res->message = "Selected point is not in this route";
+            return;
+        }
+        const auto index = static_cast<std::size_t>(std::distance(points.begin(), point));
+        if (req->action == Service::Request::MOVE_POINT_EARLIER) {
+            if (index == 0) {
+                res->message = "Point is already first in this route";
+                return;
+            }
+            std::swap(points[index], points[index - 1]);
+            res->message = "Point moved earlier in this route";
+        } else {
+            if (index + 1 >= points.size()) {
+                res->message = "Point is already last in this route";
+                return;
+            }
+            std::swap(points[index], points[index + 1]);
+            res->message = "Point moved later in this route";
+        }
+        refreshRouteVisualization();
+    } else if (req->action == Service::Request::DELETE_POINTS_EVERYWHERE) {
+        std::set<std::string> requested_ids(
+            req->route_point_ids.begin(), req->route_point_ids.end());
+        if (!req->route_point_id.empty()) {
+            requested_ids.insert(req->route_point_id);
+        }
+        if (requested_ids.empty()) {
+            res->message = "Select one or more map route points";
+            return;
+        }
+        int removed = 0;
+        for (auto &route : route_segments_) {
+            auto &points = route.via_points;
+            const auto new_end = std::remove_if(
+                points.begin(), points.end(),
+                [&requested_ids](const sahabat_interfaces::msg::Waypoint &point) {
+                    return requested_ids.count(point.id) > 0;
+                });
+            removed += static_cast<int>(std::distance(new_end, points.end()));
+            points.erase(new_end, points.end());
+        }
+        if (removed == 0) {
+            res->message = "Selected map route points no longer exist";
+            return;
+        }
+        refreshRouteVisualization();
+        res->message = std::to_string(requested_ids.size()) +
+            " point(s) deleted from every route";
+    } else {
+        res->message = "Unknown route edit action";
+        return;
+    }
+
+    res->success = true;
+    res->active_segment_id = active_segment_id_;
+}
+
 bool WaypointEditorTool::loadWaypointsFromPath(const std::string &path, bool load_yaml, std::string &error)
 {
     std::vector<Waypoint> loaded;
@@ -1609,11 +2394,25 @@ bool WaypointEditorTool::loadWaypointsFromPath(const std::string &path, bool loa
     if (!ok) {
         return false;
     }
-    for (auto &wp : loaded) {
+    for (std::size_t i = 0; i < loaded.size(); ++i) {
+        auto &wp = loaded[i];
+        if (wp.id.empty()) {
+            wp.id = std::to_string(i);
+        }
         if (wp.pose.header.frame_id.empty()) {
             wp.pose.header.frame_id = "map";
         }
         wp.pose.header.stamp = nh_->now();
+    }
+    if (load_yaml) {
+        if (!loadGraphFromYaml(path, error)) {
+            return false;
+        }
+    } else {
+        route_segments_.clear();
+        route_settings_ = YAML::Node(YAML::NodeType::Map);
+        active_segment_id_.clear();
+        add_route_point_armed_ = false;
     }
     waypoint_sequence_.assign(std::move(loaded));
     updateWaypointMarker();
@@ -1652,6 +2451,10 @@ void WaypointEditorTool::handleRedoWaypoints(const std::shared_ptr<std_srvs::srv
 void WaypointEditorTool::handleClearWaypoints(const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/, std::shared_ptr<std_srvs::srv::Trigger::Response> res)
 {
     waypoint_sequence_.clear();
+    route_segments_.clear();
+    route_settings_ = YAML::Node(YAML::NodeType::Map);
+    active_segment_id_.clear();
+    add_route_point_armed_ = false;
     pose_dirty_ = false;
     server_->clear();
     server_->applyChanges();

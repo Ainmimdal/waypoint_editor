@@ -9,14 +9,20 @@
 #include <visualization_msgs/msg/marker.hpp>
 #include <std_srvs/srv/trigger.hpp>
 #include <std_msgs/msg/float64.hpp>
+#include <std_msgs/msg/empty.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <rclcpp/executors/single_threaded_executor.hpp>
 #include <sahabat_interfaces/srv/control_lease.hpp>
+#include <sahabat_interfaces/srv/edit_route.hpp>
+#include <sahabat_interfaces/srv/get_waypoint_graph.hpp>
 #include <sahabat_interfaces/srv/get_waypoints.hpp>
 #include <sahabat_interfaces/srv/list_waypoint_sets.hpp>
 #include <sahabat_interfaces/srv/manage_waypoint_set.hpp>
 #include <sahabat_interfaces/srv/save_waypoints.hpp>
+#include <sahabat_interfaces/srv/save_waypoint_graph.hpp>
+#include <sahabat_interfaces/msg/route_segment.hpp>
 
 #include <filesystem>
 #include <string>
@@ -25,6 +31,7 @@
 
 #include <tf2_ros/transform_listener.h>
 #include <tf2_ros/buffer.h>
+#include <yaml-cpp/yaml.h>
 
 #include "waypoint_editor/core/waypoint_sequence.hpp"
 
@@ -44,6 +51,8 @@ public:
     void onPoseSet(double x, double y, double theta) override;
     void updateWaypointMarker();
     visualization_msgs::msg::InteractiveMarker createWaypointMarker(int id);
+    visualization_msgs::msg::InteractiveMarker createRoutePointMarker(
+        std::size_t segment_index, std::size_t point_index);
     void processFeedback(const std::shared_ptr<const visualization_msgs::msg::InteractiveMarkerFeedback> &fb);
     void processMenuControl(const std::shared_ptr<const visualization_msgs::msg::InteractiveMarkerFeedback> &fb);
     void handleSaveWaypoints(const std::shared_ptr<std_srvs::srv::Trigger::Request> req, std::shared_ptr<std_srvs::srv::Trigger::Response> res);
@@ -54,6 +63,12 @@ public:
     void handleListWaypointSets(const std::shared_ptr<sahabat_interfaces::srv::ListWaypointSets::Request> req, std::shared_ptr<sahabat_interfaces::srv::ListWaypointSets::Response> res);
     void handleManageWaypointSet(const std::shared_ptr<sahabat_interfaces::srv::ManageWaypointSet::Request> req, std::shared_ptr<sahabat_interfaces::srv::ManageWaypointSet::Response> res);
     void handleGetWaypoints(const std::shared_ptr<sahabat_interfaces::srv::GetWaypoints::Request> req, std::shared_ptr<sahabat_interfaces::srv::GetWaypoints::Response> res);
+    void handleGetWaypointGraph(
+        const std::shared_ptr<sahabat_interfaces::srv::GetWaypointGraph::Request> req,
+        std::shared_ptr<sahabat_interfaces::srv::GetWaypointGraph::Response> res);
+    void handleEditRoute(
+        const std::shared_ptr<sahabat_interfaces::srv::EditRoute::Request> req,
+        std::shared_ptr<sahabat_interfaces::srv::EditRoute::Response> res);
     void publishLineMarker();
     void publishTotalWpsDist();
     void publishLastWpsDist();
@@ -69,6 +84,13 @@ private:
     bool saveActiveWaypointSet(std::string &error);
     bool loadOperatorWaypointSet(const std::string &set_id, std::string &error);
     bool saveOperatorWaypointSet(std::string &error);
+    bool loadGraphFromYaml(const std::filesystem::path &path, std::string &error);
+    std::string makeWaypointId(const std::string &prefix) const;
+    int segmentIndex(const std::string &segment_id) const;
+    int waypointIndexById(const std::string &waypoint_id) const;
+    std::string routePointTag(const std::string &point_id) const;
+    void removeSegmentsForWaypoint(const std::string &waypoint_id);
+    void refreshRouteVisualization();
     bool acquireOperatorLease(std::string &lease_id, std::string &error);
     void releaseOperatorLease(const std::string &lease_id);
     bool usingOperatorBackend() const;
@@ -90,6 +112,8 @@ private:
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr line_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr total_wp_dist_pub_;
     rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr last_wp_dist_pub_;
+    rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr graph_changed_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr route_point_selected_pub_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr save_service_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr load_service_;
     rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr undo_service_;
@@ -100,9 +124,13 @@ private:
     rclcpp::Service<sahabat_interfaces::srv::ListWaypointSets>::SharedPtr list_sets_service_;
     rclcpp::Service<sahabat_interfaces::srv::ManageWaypointSet>::SharedPtr manage_set_service_;
     rclcpp::Service<sahabat_interfaces::srv::GetWaypoints>::SharedPtr get_waypoints_service_;
+    rclcpp::Service<sahabat_interfaces::srv::GetWaypointGraph>::SharedPtr get_graph_service_;
+    rclcpp::Service<sahabat_interfaces::srv::EditRoute>::SharedPtr edit_route_service_;
     rclcpp::Client<sahabat_interfaces::srv::ControlLease>::SharedPtr operator_lease_client_;
     rclcpp::Client<sahabat_interfaces::srv::GetWaypoints>::SharedPtr operator_get_waypoints_client_;
     rclcpp::Client<sahabat_interfaces::srv::SaveWaypoints>::SharedPtr operator_save_waypoints_client_;
+    rclcpp::Client<sahabat_interfaces::srv::GetWaypointGraph>::SharedPtr operator_get_graph_client_;
+    rclcpp::Client<sahabat_interfaces::srv::SaveWaypointGraph>::SharedPtr operator_save_graph_client_;
     rclcpp::Client<sahabat_interfaces::srv::ListWaypointSets>::SharedPtr operator_list_sets_client_;
     rclcpp::Client<sahabat_interfaces::srv::ManageWaypointSet>::SharedPtr operator_manage_set_client_;
     rclcpp::Subscription<std_msgs::msg::Float64>::SharedPtr auto_distance_sub_;
@@ -123,6 +151,10 @@ private:
     std::string active_set_id_;
     std::string active_set_name_{"Default"};
     int active_revision_{0};
+    std::vector<sahabat_interfaces::msg::RouteSegment> route_segments_;
+    YAML::Node route_settings_;
+    std::string active_segment_id_;
+    bool add_route_point_armed_{false};
     double marker_size_{0.25};
     double auto_min_distance_m_{1.0};
     bool auto_enabled_{false};

@@ -10,6 +10,7 @@ namespace waypoint_editor
 
 struct Waypoint
 {
+    std::string id;
     geometry_msgs::msg::PoseStamped pose;
     std::string function_command;
 };

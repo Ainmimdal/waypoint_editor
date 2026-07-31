@@ -62,7 +62,7 @@ bool WaypointYaml::Save(const std::vector<Waypoint> &waypoints, const std::strin
         const auto name = wp.function_command.empty()
             ? "waypoint_" + std::to_string(i + 1)
             : wp.function_command;
-        ofs << "- id: " << i << "\n";
+        ofs << "- id: " << (wp.id.empty() ? std::to_string(i) : wp.id) << "\n";
         ofs << "  name: \"" << EscapeYamlString(name) << "\"\n";
         ofs << "  x: " << wp.pose.pose.position.x << "\n";
         ofs << "  y: " << wp.pose.pose.position.y << "\n";
@@ -134,6 +134,9 @@ bool PopulateSahabatPose(const YAML::Node &entry, Waypoint &waypoint)
     } else {
         waypoint.function_command.clear();
     }
+    if (auto id_node = entry["id"]; id_node && id_node.IsScalar()) {
+        waypoint.id = id_node.as<std::string>();
+    }
     return true;
 }
 
@@ -162,6 +165,9 @@ bool WaypointYaml::Load(const std::string &path, std::vector<Waypoint> &waypoint
         }
 
         Waypoint waypoint;
+        if (auto id_node = entry["id"]; id_node && id_node.IsScalar()) {
+            waypoint.id = id_node.as<std::string>();
+        }
         const auto pose_node = entry["pose"];
         if (pose_node && pose_node.IsMap()) {
             if (!PopulatePose(pose_node, waypoint.pose.pose)) {
